@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
 from cairn.dispatcher.contracts import (
+    BOOTSTRAP_CONCLUDE_TEXT_ENVELOPE,
     parse_json_output,
+    parse_validated,
     validate_bootstrap_conclude_payload,
     validate_bootstrap_execute_payload,
 )
@@ -333,9 +336,8 @@ def _try_conclude_fallback(
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
         return "failed"
-    try:
-        model_output = driver.extract_response_text(result.stdout, result.stderr)
-        payload = parse_json_output(model_output)
+
+    def validate_conclude(payload: dict[str, Any]) -> tuple[str, str | None]:
         conclude_data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
         if isinstance(conclude_data, dict) and isinstance(conclude_data.get("complete"), dict):
             LOG.warning(
@@ -345,7 +347,16 @@ def _try_conclude_fallback(
                 worker.name,
                 preview(str(conclude_data.get("complete"))),
             )
-        kind, fact_description = validate_bootstrap_conclude_payload(payload)
+        return validate_bootstrap_conclude_payload(payload)
+
+    try:
+        model_output = driver.extract_response_text(result.stdout, result.stderr)
+        kind, fact_description = parse_validated(
+            model_output,
+            validate_conclude,
+            envelope=BOOTSTRAP_CONCLUDE_TEXT_ENVELOPE,
+            context=f"phase=bootstrap_conclude project={project.project.id} intent={intent.id} worker={worker.name}",
+        )
     except Exception as exc:
         LOG.warning(
             "bootstrap conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",

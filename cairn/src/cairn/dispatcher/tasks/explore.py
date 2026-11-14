@@ -4,7 +4,12 @@ import logging
 import time
 
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
-from cairn.dispatcher.contracts import parse_json_output, validate_explore_payload
+from cairn.dispatcher.contracts import (
+    EXPLORE_TEXT_ENVELOPE,
+    parse_json_output,
+    parse_validated,
+    validate_explore_payload,
+)
 from cairn.dispatcher.prompting import load_prompt, render_prompt
 from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
@@ -347,8 +352,12 @@ def _try_conclude_fallback(
         return "failed"
     try:
         model_output = driver.extract_response_text(result.stdout, result.stderr)
-        payload = parse_json_output(model_output)
-        kind, description = validate_explore_payload(payload)
+        kind, description = parse_validated(
+            model_output,
+            validate_explore_payload,
+            envelope=EXPLORE_TEXT_ENVELOPE,
+            context=f"phase=explore_conclude project={project_id} intent={intent.id} worker={worker.name}",
+        )
     except Exception as exc:
         LOG.warning(
             "conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",

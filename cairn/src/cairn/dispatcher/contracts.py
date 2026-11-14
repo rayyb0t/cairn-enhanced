@@ -1,12 +1,73 @@
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from typing import Any
 
-from cairn.dispatcher.output_parser import extract_json_object
+from cairn.dispatcher.output_parser import TextEnvelope, extract_json_object, rescue_text_envelope
+
+LOG = logging.getLogger(__name__)
+
+EXPLORE_TEXT_ENVELOPE = TextEnvelope.for_path("data", "description")
+BOOTSTRAP_CONCLUDE_TEXT_ENVELOPE = TextEnvelope.for_path("data", "fact", "description")
 
 
 def parse_json_output(stdout: str) -> dict[str, Any]:
     return extract_json_object(stdout)
+
+
+def parse_validated[T](
+    stdout: str,
+    validate: Callable[[dict[str, Any]], T],
+    *,
+    envelope: TextEnvelope,
+    context: str = "",
+) -> T:
+    """Return validate(parse_json_output(stdout)), rescuing a broken envelope only if that fails.
+
+    Today's strict parse and validation always run first and their result is returned unchanged.
+    Only when they raise ValueError is rescue_text_envelope tried, and its payload must pass the
+    same validator. Otherwise the original exception is raised again, so callers log and handle
+    the failure exactly as before.
+    """
+    try:
+        return validate(parse_json_output(stdout))
+    except ValueError as strict_error:
+        rescued = _rescue(stdout, validate, envelope, context)
+        if rescued is None:
+            raise
+        strategy, result, text = rescued
+        LOG.warning(
+            "json output rescued strategy=%s %s strict_error=%s description_chars=%s",
+            strategy,
+            context,
+            strict_error,
+            len(text),
+        )
+        LOG.debug("json output rescued %s description_preview=%r", context, text[:160])
+        return result
+
+
+def _rescue[T](
+    stdout: str,
+    validate: Callable[[dict[str, Any]], T],
+    envelope: TextEnvelope,
+    context: str,
+) -> tuple[str, T, str] | None:
+    """(strategy, validated result, rescued text), or None so that today's failure stands."""
+    if not isinstance(stdout, str):
+        return None
+    try:
+        rescued = rescue_text_envelope(stdout, envelope)
+        if rescued is None:
+            return None
+        strategy, payload = rescued
+        return strategy, validate(payload), envelope.text_of(payload)
+    except ValueError:
+        return None  # the rescued payload does not pass the task's validator either
+    except Exception:  # defensive: a rescue problem must never change today's failure
+        LOG.debug("json output rescue skipped %s", context, exc_info=True)
+        return None
 
 
 def _unwrap_wrapped_payload(payload: dict[str, Any]) -> tuple[bool | None, dict[str, Any] | None]:

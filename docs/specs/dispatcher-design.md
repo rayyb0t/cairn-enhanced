@@ -287,7 +287,7 @@ dispatcher/
 - 第一阶段超时、输出解析失败或返回了不满足契约的结果时，如果 Worker 支持 session / conclude，则进入 `bootstrap_conclude`
 - `bootstrap_conclude` 的 prompt 必须明确要求“不继续推进，不等待未完成任务，只总结当前最关键事实”，因此它只产出 `fact`
 - 如果 `bootstrap` 主阶段成功返回合法 JSON，则 Dispatcher 会先 conclude 写入 fact，再立即 complete
-- 如果 `bootstrap_conclude` 成功返回合法 JSON 且 conclude 写回成功，则保留 intent 被结论落定，项目不再视为初始态
+- 如果 `bootstrap_conclude` 成功返回合法 JSON（或按“运行时校验”中的保守修复规则取回）且 conclude 写回成功，则保留 intent 被结论落定，项目不再视为初始态
 - 如果主阶段的 `complete` 写回失败，已写入的 fact 仍然保留，后续可由下一轮 `reason` 再完成项目
 - 如果两阶段都失败，或 conclude 写回失败，则 release 当前 `bootstrap` intent，不写 Fact；项目下轮仍然按新项目处理
 
@@ -488,6 +488,7 @@ dispatcher/
 5. 如果 `conclude` 在 `conclude_timeout` 内返回合法 JSON，且 `accepted: true`：
    - Dispatcher 调用 `POST /projects/{project_id}/intents/{intent_id}/conclude`
    - 成功则结束
+   - 输出未通过严格解析或结构校验时，先按“运行时校验”中的保守修复规则尝试取回，取回成功同样按本条处理，否则按第 6 条处理
 6. 如果 `conclude` 再次超时，或输出不合法，或返回 `accepted: false`，或 `POST /projects/{project_id}/intents/{intent_id}/conclude` 写入失败：
    - 整次探索作废
    - 不写任何图数据
@@ -667,7 +668,7 @@ driver 按各自 provider 的协议构造请求：`claudecode` 打 `{base}/v1/me
 执行规则：
 
 - 每次准备启动某个 Worker 进程前，都先执行一次健康检查
-- `explore` 进入 timeout / parse-fail 后的 `explore_conclude` fallback 不再重复执行健康检查，而是直接尝试 conclude，并继续依赖 JSON / schema 校验决定是否写回
+- `explore` 进入 timeout / parse-fail 后的 `explore_conclude` fallback 不再重复执行健康检查，而是直接尝试 conclude，并继续依赖 JSON / schema 校验（含“运行时校验”中的保守修复规则）决定是否写回
 - HTTP 2xx 视为健康
 - 非 2xx / 连接失败 / 超时（`requests` 超时由 `runtime.healthcheck_timeout` 控制）视为不健康
 - 如果这次失败，本次任务直接作废，并将这个 Worker 放入一个短暂不可选窗口
@@ -854,6 +855,11 @@ codex exec resume "{session}" --dangerously-bypass-approvals-and-sandbox --model
 - 如果要走双阶段 `explore`，则第一阶段必须成功拿到 session id，才能进入 `conclude`
 - 如果要走双阶段 `bootstrap`，则第一阶段必须成功拿到 session id，才能进入 `bootstrap_conclude`
 - Dispatcher 必须对 `stdout` 全文做 JSON 解析和任务级结构校验
+- 保守修复：`explore_conclude` 与 `bootstrap_conclude` 的输出若未通过严格解析或结构校验，Dispatcher 会先做一次确定性的修复尝试（不会再次调用模型），其他阶段的解析行为不变：
+  - 仅当整段输出恰好是一个 `{"accepted": true, "data": ...}` 信封（可单独放在一个代码块中）、且各层键与 prompt 要求完全一致时才尝试；拒绝结果、旧格式、信封外还有其他文字都不修复
+  - 若输出除字符串内含原始 TAB / LF / CR 等控制字符外是合法 JSON，则按 JSON 解析，出现重复键即放弃
+  - 若输出本身不是合法 JSON（通常是描述文本含未转义双引号），则按固定前后缀把中间文本原样作为描述；描述中出现反斜杠、信封结束序列、括号不配对，或在内嵌 JSON 对象之外出现键值分隔时即放弃
+  - 修复出的描述不得含 TAB / LF / CR 以外的控制字符，且仍须通过同样的结构校验；任何一步不满足都按原解析失败处理。修复成功时记录一条 warning 日志
 - `accepted: false`、JSON 非法、字段缺失、接口写回失败等情况都必须记日志，且不做立即重试
 
 ---
