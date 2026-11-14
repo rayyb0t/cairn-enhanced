@@ -1,0 +1,22 @@
+# Same rule set as the dev-0.3.0 branch (cairn/pyproject.toml there), for these standalone tools.
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "S", "A", "T20", "SIM", "RUF"]
+ignore = [
+    "E501",  # long log formats and table rows are fine
+    "S101",  # assert in tests
+    "S108",  # container paths under /tmp are intentional
+    "S603",  # subprocess without a shell is intentional
+    "S607",  # partial executable paths (docker, grep) are intentional
+    "A002",  # argument names that shadow builtins
+    "SIM108",
+]
+
+[lint.per-file-ignores]
+# These are command-line tools: printing the results is their job.
+"*.py" = ["T201"]
+
+[lint.isort]
+known-first-party = ["cairn", "baseline_from_logs", "export_eval_set", "kill_check"]
