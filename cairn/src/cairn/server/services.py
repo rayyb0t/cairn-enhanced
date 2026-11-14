@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from cairn.server.db import get_conn
 from cairn.server.models import Intent, IntentIssue, ProjectMeta, ProjectReason
 
 LOG = logging.getLogger(__name__)
@@ -17,6 +18,10 @@ JSON_REPAIRED = "json_repaired"
 # The strategies of the dispatcher's JSON rescue (cairn.dispatcher.output_parser.rescue_text_envelope).
 JSON_REPAIR_STRATEGIES = frozenset({"lenient_decode", "envelope_repair"})
 _ISSUE_ERROR_MAX_CHARS = 300
+# Recording an issue waits at most this long for a busy database (the request's own work is already done).
+_ISSUE_WRITE_BUSY_TIMEOUT_S = 1.0
+# A stored detail nested deeper than this is shown as {}; very deep values cannot be serialized.
+_ISSUE_DETAIL_MAX_DEPTH = 8
 
 
 def utcnow() -> str:
@@ -213,37 +218,34 @@ def json_repair_detail(value: Any) -> dict[str, str] | None:
 
 
 def record_intent_issue(
-    conn: sqlite3.Connection,
     project_id: str,
     intent_id: str,
     kind: str,
     detail: dict[str, Any],
     now: str,
     run_id: str | None = None,
-) -> bool:
-    """Insert an issue without ever changing the outcome of the request that records it.
+) -> IntentIssue | None:
+    """Record an issue in its own short transaction, after the reporting request's work has committed.
 
-    The insert runs in a savepoint. If it fails, only the savepoint is rolled back and the error is
-    logged, so the rest of the request's transaction (for a conclude, the fact) still commits.
+    Best effort: any failure (a busy or full database, a missing table, anything else) is logged and
+    None is returned, so recording an issue can never change the outcome of the request that reports it.
     """
-    conn.execute("SAVEPOINT record_intent_issue")
     try:
-        conn.execute(
-            "INSERT INTO intent_issues (project_id, intent_id, run_id, kind, detail_json, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (project_id, intent_id, run_id, kind, json.dumps(detail, ensure_ascii=False), now, now),
-        )
+        with get_conn(timeout=_ISSUE_WRITE_BUSY_TIMEOUT_S) as conn:
+            cursor = conn.execute(
+                "INSERT INTO intent_issues (project_id, intent_id, run_id, kind, detail_json, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (project_id, intent_id, run_id, kind, json.dumps(detail, ensure_ascii=False), now, now),
+            )
+            issue_id = cursor.lastrowid
+        if issue_id is None:  # stored, but the response cannot name it
+            return None
+        return IntentIssue(id=issue_id, kind=kind, run_id=run_id, detail=detail, created_at=now, updated_at=now)
     except Exception:
-        if not conn.in_transaction:
-            raise  # the error ended the whole transaction, so the request cannot succeed either
-        conn.execute("ROLLBACK TO SAVEPOINT record_intent_issue")
-        conn.execute("RELEASE SAVEPOINT record_intent_issue")
         LOG.warning(
             "intent issue not recorded project=%s intent=%s kind=%s", project_id, intent_id, kind, exc_info=True
         )
-        return False
-    conn.execute("RELEASE SAVEPOINT record_intent_issue")
-    return True
+        return None
 
 
 def load_intent_issues(
@@ -251,8 +253,9 @@ def load_intent_issues(
 ) -> dict[str, list[IntentIssue]]:
     """Issues by intent id, newest first, for one intent or the whole project.
 
-    Reading them never fails the request: on a database error the issues are left out and the error is
-    logged, and a row this server cannot read is skipped.
+    Reading them never fails the request. On a database error, including text that cannot be decoded, the
+    issues are left out and the error is logged; a row whose fields this server cannot read is skipped,
+    and a detail that is not a shallow JSON object is shown as {}.
     """
     query = "SELECT * FROM intent_issues WHERE project_id = ?"
     params: tuple = (project_id,)
@@ -278,20 +281,30 @@ def load_intent_issues(
 def _issue_from_row(row: sqlite3.Row) -> IntentIssue | None:
     try:
         detail = json.loads(row["detail_json"])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         detail = None
     try:
         return IntentIssue(
             id=row["id"],
             kind=row["kind"],
             run_id=row["run_id"],
-            detail=detail if isinstance(detail, dict) else {},
+            detail=detail if isinstance(detail, dict) and _within_depth(detail) else {},
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
     except ValidationError:
         LOG.warning("intent issue skipped id=%s", row["id"])
         return None
+
+
+def _within_depth(value: Any, depth: int = 0) -> bool:
+    if depth > _ISSUE_DETAIL_MAX_DEPTH:
+        return False
+    if isinstance(value, dict):
+        return all(_within_depth(item, depth + 1) for item in value.values())
+    if isinstance(value, list):
+        return all(_within_depth(item, depth + 1) for item in value)
+    return True
 
 
 def get_intent_timeout(conn: sqlite3.Connection) -> int:

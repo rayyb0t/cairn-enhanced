@@ -27,8 +27,9 @@ from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.runtime.process import ProcessResult
 from cairn.dispatcher.tasks import explore
 from cairn.dispatcher.tasks.common import write_conclude_result
-from cairn.server import db
+from cairn.server import db, services
 from cairn.server.app import app
+from cairn.server.models import ProjectDetail
 from cairn.server.services import record_intent_issue
 
 REPAIR = {"strategy": "envelope_repair", "error": "no JSON object found in output"}
@@ -175,11 +176,104 @@ def test_a_missing_issues_table_never_fails_any_endpoint(server: TestClient, cap
     assert any("intent issues not loaded" in record.getMessage() for record in caplog.records)
 
 
+def test_an_issue_write_that_ends_its_transaction_never_fails_the_conclude(server: TestClient, caplog) -> None:
+    # RAISE(ROLLBACK) ends the whole transaction it runs in, like SQLITE_FULL or an I/O error would. The
+    # issue is written in its own transaction after the conclude commits, so the fact is never lost.
+    project_id = _project_with_intents(server)
+    with db.get_conn() as conn:
+        conn.execute(
+            "CREATE TRIGGER end_transaction BEFORE INSERT ON intent_issues"
+            " BEGIN SELECT RAISE(ROLLBACK, 'ends the transaction'); END"
+        )
+    caplog.set_level(logging.WARNING, logger="cairn.server.services")
+
+    response = _conclude(server, project_id, "i001", parse_repair=REPAIR)
+
+    assert response.status_code == 200
+    assert response.json()["fact"] == {"id": "f001", "description": "fact for i001"}
+    assert response.json()["intent"]["issues"] == []
+    intent = _intent(server, project_id, "i001")
+    assert (intent["to"], intent["issues"]) == ("f001", [])
+    assert "f001" in _fact_ids(server, project_id)
+    assert any("intent issue not recorded" in record.getMessage() for record in caplog.records)
+
+
+def test_any_error_while_recording_never_fails_the_conclude(server: TestClient, monkeypatch) -> None:
+    project_id = _project_with_intents(server)
+
+    def broken_connection(*_args: Any, **_kwargs: Any):
+        raise RuntimeError("no connection for issues")
+
+    monkeypatch.setattr(services, "get_conn", broken_connection)
+    response = _conclude(server, project_id, "i001", parse_repair=REPAIR)
+    assert response.status_code == 200
+    assert response.json()["fact"]["id"] == "f001"
+    assert "f001" in _fact_ids(server, project_id)
+
+
+def test_deep_or_undecodable_issue_details_never_fail_reads(server: TestClient) -> None:
+    project_id = _project_with_intents(server, count=2)
+    assert _conclude(server, project_id, "i001", parse_repair=REPAIR).status_code == 200
+    too_deep = '{"a": ' * 50 + "1" + "}" * 50  # valid JSON, too deep to serialize safely
+    recursion = '{"a": ' * 200_000 + "1" + "}" * 200_000  # json.loads raises RecursionError
+    with db.get_conn() as conn:
+        for intent_id, detail in (("i001", too_deep), ("i002", too_deep), ("i002", recursion)):
+            conn.execute(
+                "INSERT INTO intent_issues (project_id, intent_id, kind, detail_json, created_at, updated_at)"
+                " VALUES (?, ?, 'deep', ?, 'x', 'x')",
+                (project_id, intent_id, detail),
+            )
+    detail = server.get(f"/projects/{project_id}")
+    assert detail.status_code == 200
+    heartbeat = server.post(f"/projects/{project_id}/intents/i002/heartbeat", json={"worker": "explorer"})
+    assert heartbeat.status_code == 200
+    assert [issue["detail"] for issue in heartbeat.json()["issues"]] == [{}, {}]
+    assert [(i["kind"], i["detail"]) for i in _intent(server, project_id, "i001")["issues"]] == [
+        ("deep", {}),
+        ("json_repaired", REPAIR),
+    ]
+
+
+@pytest.mark.parametrize(
+    "issues",
+    [
+        pytest.param([{"id": "uuid-1", "kind": "k", "detail": {}, "created_at": "x", "updated_at": "x"}], id="text-id"),
+        pytest.param([{"id": 1, "kind": "k", "detail": [], "created_at": "x", "updated_at": "x"}], id="list-detail"),
+        pytest.param([{"id": 1, "kind": "k", "detail": {}, "created_at": "x"}], id="missing-updated-at"),
+        pytest.param([{"id": 1, "kind": "k", "run_id": 7, "created_at": "x", "updated_at": "x"}], id="number-run-id"),
+        pytest.param("not a list", id="not-a-list"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_shared_models_drop_issue_shapes_they_cannot_read(issues: Any) -> None:
+    # The dispatcher parses project reads with these models; a newer server's issue shape must never
+    # make that parse fail. Readable issues next to an unreadable one are kept.
+    readable = {"id": 2, "kind": "json_repaired", "detail": REPAIR, "created_at": "x", "updated_at": "x"}
+    payload = {
+        "project": {"id": "p", "title": "t", "status": "active", "bootstrap_enabled": True, "created_at": "x"},
+        "facts": [],
+        "hints": [],
+        "intents": [
+            {"id": "i1", "from": ["origin"], "description": "d", "creator": "c", "created_at": "x", "issues": issues},
+            {
+                "id": "i2",
+                "from": ["origin"],
+                "description": "d",
+                "creator": "c",
+                "created_at": "x",
+                "issues": [*(issues if isinstance(issues, list) else []), readable],
+            },
+        ],
+    }
+    project = ProjectDetail.model_validate(payload)
+    assert project.intents[0].issues == []
+    assert [issue.id for issue in project.intents[1].issues] == [2]
+
+
 def test_issues_are_listed_newest_first(server: TestClient) -> None:
     project_id = _project_with_intents(server)
     assert _conclude(server, project_id, "i001", parse_repair=REPAIR).status_code == 200
-    with db.get_conn() as conn:
-        assert record_intent_issue(conn, project_id, "i001", "later_kind", {"n": 2}, "2030-01-01T00:00:00Z")
+    assert record_intent_issue(project_id, "i001", "later_kind", {"n": 2}, "2030-01-01T00:00:00Z") is not None
     issues = _intent(server, project_id, "i001")["issues"]
     assert [issue["kind"] for issue in issues] == ["later_kind", "json_repaired"]
     assert issues[0]["id"] > issues[1]["id"]
@@ -226,8 +320,7 @@ def test_the_graph_export_workers_read_never_contains_issues(server: TestClient)
     project_id = _project_with_intents(server, count=2)
     assert _conclude(server, project_id, "i001", parse_repair=REPAIR).status_code == 200
     before = server.get(f"/projects/{project_id}/export", params={"format": "yaml"}).text
-    with db.get_conn() as conn:
-        record_intent_issue(conn, project_id, "i002", "json_repaired", {"strategy": "lenient_decode"}, "x")
+    assert record_intent_issue(project_id, "i002", "json_repaired", {"strategy": "lenient_decode"}, "x") is not None
     after = server.get(f"/projects/{project_id}/export", params={"format": "yaml"}).text
     timeline = server.get(f"/projects/{project_id}/export", params={"format": "timeline"}).text
     assert before == after

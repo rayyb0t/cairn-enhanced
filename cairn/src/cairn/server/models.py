@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, ValidatorFunctionWrapHandler, field_validator
 
 
 class Settings(BaseModel):
@@ -40,6 +40,21 @@ class Intent(BaseModel):
     issues: list[IntentIssue] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
+
+    @field_validator("issues", mode="wrap")
+    @classmethod
+    def drop_unreadable_issues(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> list[IntentIssue]:
+        # The dispatcher parses these models too: an issue whose shape this version does not know (for
+        # example from a newer server) is dropped instead of failing the whole project read.
+        if not isinstance(value, list):
+            return []
+        issues: list[IntentIssue] = []
+        for item in value:
+            try:
+                issues.extend(handler([item]))
+            except ValidationError:
+                continue
+        return issues
 
 
 class Hint(BaseModel):

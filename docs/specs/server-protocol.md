@@ -157,7 +157,7 @@ issues          # 运行中出现的问题（只读，最新在前），无问�
 
 超时清空 worker 只针对尚无结论的 Intent。已结论的 Intent 不参与超时逻辑，worker 永久保留为产出结论的消费者标识。
 
-**issues 字段：** 只读的追加字段，记录该 Intent 运行中出现、需要在界面上提示的问题（界面上显示为提示图标；已结论的 Intent 显示在其产出的 Fact 节点上）。每条包含 `id`、`kind`、`run_id`（目前恒为 `null`）、`detail`（对象）、`created_at`、`updated_at`。目前只有一种 `kind`：`json_repaired`，表示 conclude 的输出在严格解析失败后经保守修复才解析成功，`detail` 为 `{"strategy": "lenient_decode" | "envelope_repair", "error": "<严格解析的错误>"}`，由 conclude 请求的可选字段 `parse_repair` 写入。`issues` 不参与导出（YAML 与 timeline 都不含），因此不会进入消费者读取的图快照。不认识该字段的客户端可直接忽略。
+**issues 字段：** 只读的追加字段，记录该 Intent 运行中出现、需要在界面上提示的问题（界面上显示为提示图标；已结论的 Intent 显示在其产出的 Fact 节点上）。每条包含 `id`、`kind`、`run_id`（目前恒为 `null`）、`detail`（对象）、`created_at`、`updated_at`。目前只有一种 `kind`：`json_repaired`，表示 conclude 的输出在严格解析失败后经保守修复才解析成功，`detail` 为 `{"strategy": "lenient_decode" | "envelope_repair", "error": "<严格解析的错误>"}`，由 conclude 请求的可选字段 `parse_repair` 写入。`issues` 不参与导出（YAML 与 timeline 都不含），因此不会进入消费者读取的图快照。不认识该字段的客户端可直接忽略；读取方遇到无法识别的 issue 应跳过该条，而不是让整个读取失败。
 
 ### Hint
 
@@ -550,7 +550,7 @@ Body：
 }
 ```
 
-可选字段 `parse_repair`：消费者在 conclude 输出经 JSON 修复才解析成功时附带，例如 `{"strategy": "envelope_repair", "error": "accepted must be true or false"}`。服务端在同一事务内把它记录为该 Intent 的一条 `json_repaired` issue（`error` 截断到 300 字符）。该字段只作记录，不影响结论：值无法识别时直接忽略，不返回 422；记录失败只回滚这条记录并写日志，Fact 与结论照常提交。不带该字段时行为与之前完全相同。
+可选字段 `parse_repair`：消费者在 conclude 输出经 JSON 修复才解析成功时附带，例如 `{"strategy": "envelope_repair", "error": "accepted must be true or false"}`。服务端在 Fact 与结论提交之后，用单独的短事务把它记录为该 Intent 的一条 `json_repaired` issue（`error` 截断到 300 字符）。该字段只作记录，不影响结论：值无法识别时直接忽略，不返回 422；记录失败只写日志，已提交的 Fact 与结论不受影响（响应中的 `intent.issues` 此时不含这条记录）。不带该字段时行为与之前完全相同。
 
 响应：
 

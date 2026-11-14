@@ -139,17 +139,22 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
             "UPDATE intents SET to_fact_id = ?, worker = ?, last_heartbeat_at = ?, concluded_at = ? WHERE id = ? AND project_id = ?",
             (fid, body.worker, now, now, intent_id, project_id),
         )
-        repair = json_repair_detail(body.parse_repair)
-        if repair is not None:
-            # Best effort: a failure here is logged and never fails the conclude.
-            record_intent_issue(conn, project_id, intent_id, JSON_REPAIRED, repair, now)
 
         updated = conn.execute(
             "SELECT * FROM intents WHERE id = ? AND project_id = ?",
             (intent_id, project_id),
         ).fetchone()
 
-        return ConcludeResponse(
+        response = ConcludeResponse(
             fact=Fact(id=fid, description=body.description),
             intent=intent_to_model(conn, updated, project_id),
         )
+
+    # The fact and the conclusion are committed above, exactly as before. The optional rescue report is
+    # recorded afterwards in its own short transaction, best effort, so it can never change the outcome.
+    repair = json_repair_detail(body.parse_repair)
+    if repair is not None:
+        issue = record_intent_issue(project_id, intent_id, JSON_REPAIRED, repair, now)
+        if issue is not None:
+            response.intent.issues.insert(0, issue)
+    return response

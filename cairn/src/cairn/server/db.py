@@ -118,9 +118,9 @@ def _ensure_project_columns(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def get_conn() -> Generator[sqlite3.Connection, None, None]:
+def get_conn(timeout: float = 5.0) -> Generator[sqlite3.Connection, None, None]:
     assert _db_path is not None
-    conn = sqlite3.connect(str(_db_path))
+    conn = sqlite3.connect(str(_db_path), timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
