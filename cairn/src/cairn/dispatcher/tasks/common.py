@@ -152,6 +152,7 @@ def write_conclude_result(
     source: str,
     phase_ms: int,
     total_ms: int | None = None,
+    parse_repair: dict[str, str] | None = None,
 ) -> str:
     return write_conclude_result_with_fact_id(
         client,
@@ -162,6 +163,7 @@ def write_conclude_result(
         source=source,
         phase_ms=phase_ms,
         total_ms=total_ms,
+        parse_repair=parse_repair,
     ).status
 
 
@@ -175,8 +177,13 @@ def write_conclude_result_with_fact_id(
     source: str,
     phase_ms: int,
     total_ms: int | None = None,
+    parse_repair: dict[str, str] | None = None,
 ) -> ConcludeWriteResult:
-    response = client.conclude(project_id, intent_id, worker_name, description)
+    if parse_repair is None:
+        response = client.conclude(project_id, intent_id, worker_name, description)
+    else:
+        # Only a rescued output adds the optional field (it becomes the json_repaired badge).
+        response = client.conclude(project_id, intent_id, worker_name, description, parse_repair=parse_repair)
     if response.ok:
         fact_id: str | None = None
         if isinstance(response.data, dict):

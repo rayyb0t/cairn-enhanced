@@ -7,6 +7,7 @@ from typing import Any
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
 from cairn.dispatcher.contracts import (
     BOOTSTRAP_CONCLUDE_TEXT_ENVELOPE,
+    RescueReport,
     parse_json_output,
     parse_validated,
     validate_bootstrap_conclude_payload,
@@ -349,6 +350,7 @@ def _try_conclude_fallback(
             )
         return validate_bootstrap_conclude_payload(payload)
 
+    rescue = RescueReport()
     try:
         model_output = driver.extract_response_text(result.stdout, result.stderr)
         kind, fact_description = parse_validated(
@@ -356,6 +358,7 @@ def _try_conclude_fallback(
             validate_conclude,
             envelope=BOOTSTRAP_CONCLUDE_TEXT_ENVELOPE,
             context=f"phase=bootstrap_conclude project={project.project.id} intent={intent.id} worker={worker.name}",
+            on_rescue=rescue,
         )
     except Exception as exc:
         LOG.warning(
@@ -389,6 +392,7 @@ def _try_conclude_fallback(
         fact_description,
         source="bootstrap_conclude",
         phase_ms=conclude_ms,
+        parse_repair=rescue.parse_repair,
     )
 
 

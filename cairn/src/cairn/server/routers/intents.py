@@ -10,12 +10,15 @@ from cairn.server.models import (
     Intent,
 )
 from cairn.server.services import (
+    JSON_REPAIRED,
     check_project_active,
     get_claimable_open_intent_or_404,
     get_releasable_open_intent_or_404,
     intent_to_model,
+    json_repair_detail,
     next_fact_id,
     next_intent_id,
+    record_intent_issue,
     utcnow,
     validate_facts_exist,
     validate_intent_creator_worker,
@@ -68,6 +71,7 @@ def create_intent(project_id: str, body: CreateIntentRequest):
             last_heartbeat_at=now if claimed else None,
             created_at=now,
             concluded_at=None,
+            issues=[],
         )
 
 
@@ -135,6 +139,10 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
             "UPDATE intents SET to_fact_id = ?, worker = ?, last_heartbeat_at = ?, concluded_at = ? WHERE id = ? AND project_id = ?",
             (fid, body.worker, now, now, intent_id, project_id),
         )
+        repair = json_repair_detail(body.parse_repair)
+        if repair is not None:
+            # Best effort: a failure here is logged and never fails the conclude.
+            record_intent_issue(conn, project_id, intent_id, JSON_REPAIRED, repair, now)
 
         updated = conn.execute(
             "SELECT * FROM intents WHERE id = ? AND project_id = ?",

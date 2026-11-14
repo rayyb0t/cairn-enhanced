@@ -451,6 +451,11 @@ def test_timed_out_explore_with_broken_conclude_json_now_concludes(
     assert "phase=explore_conclude project=proj_001 intent=i001 worker=test-worker" in message
     assert f"strict_error={today_error}" in message
     assert f"description_chars={len(description)}" in message
+    # The rescue is reported with the conclude, as the logged strategy and today's error.
+    assert len(client.parse_repairs) == 1
+    reported = client.parse_repairs[0]
+    assert reported == {"strategy": reported["strategy"], "error": today_error}
+    assert f"strategy={reported['strategy']} " in message
 
 
 def test_unrecoverable_explore_conclude_still_releases_and_fails(monkeypatch, caplog) -> None:
@@ -474,6 +479,7 @@ def test_explore_execute_parse_is_unchanged_and_still_falls_back_to_conclude(mon
     outcome, client, driver = _run_explore(monkeypatch, [broken_execute, conclude])
     assert outcome == "success"
     assert client.concluded == [("proj_001", "i001", "test-worker", "from conclude")]
+    assert client.parse_repairs == [None]
     assert len(driver.conclude_prompts) == 1
 
 
@@ -484,6 +490,7 @@ def test_timed_out_bootstrap_with_broken_conclude_json_now_concludes(monkeypatch
     )
     assert outcome == "success"
     assert client.concluded == [("proj_001", "i001", "test-worker", NESTED_CREDENTIALS)]
+    assert client.parse_repairs == [{"strategy": "envelope_repair", "error": "accepted must be true or false"}]
     assert client.released == []
     records = _rescue_records(caplog)
     assert len(records) == 1
@@ -507,6 +514,7 @@ def test_bootstrap_conclude_complete_warning_is_logged_once_as_before(monkeypatc
     outcome, client, _driver = _run_bootstrap(monkeypatch, [TIMED_OUT, conclude])
     assert outcome == "success"
     assert client.concluded == [("proj_001", "i001", "test-worker", "solved")]
+    assert client.parse_repairs == [None]
     warnings = [record for record in caplog.records if "unexpected complete payload" in record.getMessage()]
     assert len(warnings) == 1
     assert _rescue_records(caplog) == []

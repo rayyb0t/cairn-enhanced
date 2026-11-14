@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -15,6 +15,17 @@ class Fact(BaseModel):
     description: str
 
 
+class IntentIssue(BaseModel):
+    """Something that happened to an intent's run, shown as a badge in the UI (kind e.g. json_repaired)."""
+
+    id: int
+    kind: str
+    run_id: str | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+
+
 class Intent(BaseModel):
     id: str
     from_: list[str] = Field(alias="from")
@@ -25,6 +36,8 @@ class Intent(BaseModel):
     last_heartbeat_at: str | None = None
     created_at: str
     concluded_at: str | None = None
+    # Additive: newest first, empty when nothing happened. Not part of the graph export workers read.
+    issues: list[IntentIssue] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 
@@ -167,6 +180,10 @@ class ReasonClaimRequest(BaseModel):
 class ConcludeRequest(BaseModel):
     worker: str
     description: str
+    # Optional, sent by the dispatcher when the output parsed only after its JSON rescue. Typed loosely
+    # on purpose: a value the server does not understand is ignored, never refused with a 422, so this
+    # field can never make a conclude fail (see services.json_repair_detail).
+    parse_repair: Any = None
 
     @field_validator("worker", "description")
     @classmethod

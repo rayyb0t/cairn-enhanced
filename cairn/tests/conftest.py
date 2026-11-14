@@ -112,6 +112,7 @@ class FakeContainerManager:
 class FakeClient:
     project: ProjectDetail
     concluded: list[tuple[str, str, str, str]] = field(default_factory=list)
+    parse_repairs: list[dict[str, str] | None] = field(default_factory=list)
     completed: list[tuple[str, list[str], str, str]] = field(default_factory=list)
     created_intents: list[tuple[str, list[str], str, str]] = field(default_factory=list)
     released: list[tuple[str, str, str]] = field(default_factory=list)
@@ -120,8 +121,17 @@ class FakeClient:
     def get_project(self, _project_id: str) -> ProjectDetail:
         return self.project
 
-    def conclude(self, project_id: str, intent_id: str, worker: str, description: str) -> ApiResult:
+    def conclude(
+        self,
+        project_id: str,
+        intent_id: str,
+        worker: str,
+        description: str,
+        *,
+        parse_repair: dict[str, str] | None = None,
+    ) -> ApiResult:
         self.concluded.append((project_id, intent_id, worker, description))
+        self.parse_repairs.append(parse_repair)
         return ApiResult(200, {"fact": {"id": "f002"}})
 
     def complete(self, project_id: str, from_ids: list[str], description: str, worker: str) -> ApiResult:

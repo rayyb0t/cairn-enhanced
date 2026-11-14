@@ -860,6 +860,7 @@ codex exec resume "{session}" --dangerously-bypass-approvals-and-sandbox --model
   - 若输出除字符串内含原始 TAB / LF / CR 等控制字符外是合法 JSON，则按 JSON 解析，出现重复键即放弃
   - 若输出本身不是合法 JSON（通常是描述文本含未转义双引号），则按固定前后缀把中间文本原样作为描述；描述中出现反斜杠、信封结束序列、括号不配对，或在内嵌 JSON 对象之外出现键值分隔时即放弃
   - 修复出的描述不得含 TAB / LF / CR 以外的控制字符，且仍须通过同样的结构校验；任何一步不满足都按原解析失败处理。修复成功时记录一条 warning 日志
+  - 修复成功时，conclude 请求附带可选字段 `parse_repair`（`{"strategy": ..., "error": <严格解析的错误>}`），服务端据此为该 Intent 记录一条 `json_repaired` issue，界面在其产出的 Fact 节点上显示提示图标；未经修复的 conclude 请求体与之前完全相同。该字段只作记录，不影响写回结果
 - `accepted: false`、JSON 非法、字段缺失、接口写回失败等情况都必须记日志，且不做立即重试
 
 ---

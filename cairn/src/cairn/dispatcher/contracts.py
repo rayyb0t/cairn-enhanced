@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from cairn.dispatcher.output_parser import TextEnvelope, extract_json_object, rescue_text_envelope
@@ -16,12 +17,26 @@ def parse_json_output(stdout: str) -> dict[str, Any]:
     return extract_json_object(stdout)
 
 
+@dataclass(slots=True)
+class RescueReport:
+    """Pass as parse_validated's on_rescue to learn whether the result came from the rescue.
+
+    parse_repair then holds the conclude request's optional parse_repair field, or None.
+    """
+
+    parse_repair: dict[str, str] | None = None
+
+    def __call__(self, strategy: str, strict_error: str) -> None:
+        self.parse_repair = {"strategy": strategy, "error": strict_error}
+
+
 def parse_validated[T](
     stdout: str,
     validate: Callable[[dict[str, Any]], T],
     *,
     envelope: TextEnvelope,
     context: str = "",
+    on_rescue: Callable[[str, str], None] | None = None,
 ) -> T:
     """Return validate(parse_json_output(stdout)), rescuing a broken envelope only if that fails.
 
@@ -29,6 +44,10 @@ def parse_validated[T](
     Only when they raise ValueError is rescue_text_envelope tried, and its payload must pass the
     same validator. Otherwise the original exception is raised again, so callers log and handle
     the failure exactly as before.
+
+    on_rescue, if given, is called as on_rescue(strategy, strict_error) only when the result came
+    from the rescue, so the caller can report it. It never changes the result: an error in it is
+    only logged.
     """
     try:
         return validate(parse_json_output(stdout))
@@ -45,6 +64,11 @@ def parse_validated[T](
             len(text),
         )
         LOG.debug("json output rescued %s description_preview=%r", context, text[:160])
+        if on_rescue is not None:
+            try:
+                on_rescue(strategy, str(strict_error))
+            except Exception:
+                LOG.warning("json output rescue report failed %s", context, exc_info=True)
         return result
 
 

@@ -567,6 +567,15 @@
       </div>
 
       <div id="cy" class="relative z-0 flex-1 h-full"></div>
+      <div x-show="issueTip" x-cloak
+        class="fixed z-50 pointer-events-none max-w-xs rounded-lg border border-amber-200 bg-white/95 px-3 py-2 text-xs shadow-lg space-y-1"
+        :style="issueTip ? `left:${issueTip.x}px;top:${issueTip.y}px` : ''">
+        <p class="font-semibold text-amber-700" x-text="issueTip ? issueTip.title : ''"></p>
+        <template x-for="(line, index) in (issueTip ? issueTip.lines : [])" :key="index">
+          <p class="text-slate-600 break-words" x-text="line"></p>
+        </template>
+        <p x-show="issueTip && issueTip.more" class="text-slate-400" x-text="issueTip ? issueTip.more : ''"></p>
+      </div>
     </div>
 
     <div @pointerdown.prevent="startPanelResize($event)" class="w-2 shrink-0 cursor-col-resize group flex items-stretch justify-center touch-none relative z-20">
@@ -674,6 +683,20 @@
                     <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Creator</span><span class="text-slate-600 text-right break-all" x-text="selectedFactProducingIntent().creator"></span></div>
                     <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Worker</span><span class="text-slate-600 text-right break-all" x-text="selectedFactProducingIntent().worker || '—'"></span></div>
                     <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Concluded</span><span class="text-slate-600 text-right break-words" x-text="formatTime(selectedFactProducingIntent().concluded_at || selectedFactProducingIntent().created_at)"></span></div>
+                    <template x-if="(selectedFactProducingIntent().issues || []).length">
+                    <div class="pt-1 space-y-2">
+                      <p class="text-[10px] font-semibold text-amber-600 uppercase tracking-widest">Issues</p>
+                      <template x-for="issue in selectedFactProducingIntent().issues" :key="issue.id">
+                        <div class="rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 space-y-1">
+                          <p class="font-semibold text-amber-700" x-text="issueTitle(issue)"></p>
+                          <template x-for="(line, index) in issueLines(issue)" :key="index">
+                            <p class="text-slate-600 break-words" x-text="line"></p>
+                          </template>
+                          <p class="text-slate-400" x-text="formatTime(issue.created_at)"></p>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
                   </div>
                 </template>
               </div>
@@ -699,6 +722,20 @@
                 <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Created</span><span class="text-slate-600 text-right break-words" x-text="formatTime(selectedIntentRecord().created_at)"></span></div>
                 <template x-if="selectedIntentRecord().concluded_at">
                   <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Concluded</span><span class="text-slate-600 text-right break-words" x-text="formatTime(selectedIntentRecord().concluded_at)"></span></div>
+                </template>
+                <template x-if="(selectedIntentRecord().issues || []).length">
+                  <div class="pt-1 space-y-2">
+                    <p class="text-[10px] font-semibold text-amber-600 uppercase tracking-widest">Issues</p>
+                    <template x-for="issue in selectedIntentRecord().issues" :key="issue.id">
+                      <div class="rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 space-y-1">
+                        <p class="font-semibold text-amber-700" x-text="issueTitle(issue)"></p>
+                        <template x-for="(line, index) in issueLines(issue)" :key="index">
+                          <p class="text-slate-600 break-words" x-text="line"></p>
+                        </template>
+                        <p class="text-slate-400" x-text="formatTime(issue.created_at)"></p>
+                      </div>
+                    </template>
+                  </div>
                 </template>
               </div>
             </div>
@@ -1079,6 +1116,7 @@ function cairnApp() {
     polling: true,
     pollTimer: null,
     cy: null,
+    issueTip: null,
     sideTab: 'detail',
     selectedNode: null,
     selectedFacts: [],
@@ -2140,6 +2178,11 @@ function cairnApp() {
     buildElements() {
       const nodes = [];
       const edges = [];
+      // A concluded intent is drawn as edges into its fact, so its issue badge goes on that fact node.
+      const issueCountByFact = new Map();
+      for (const intent of this.project.intents) {
+        if (intent.to) issueCountByFact.set(intent.to, (intent.issues || []).length);
+      }
       for (const f of this.project.facts) {
         const nodeType = f.id === 'origin' ? 'origin' : f.id === 'goal' ? 'goal' : 'fact';
         const label = this.summarizeFactLabel(f);
@@ -2151,6 +2194,7 @@ function cairnApp() {
           nodeType,
           width: size.width,
           height: size.height,
+          issueCount: nodeType === 'fact' ? (issueCountByFact.get(f.id) || 0) : 0,
         }});
       }
       for (const intent of this.project.intents) {
@@ -2171,6 +2215,7 @@ function cairnApp() {
             intentId: intent.id,
             width: nodeSize.width,
             height: nodeSize.height,
+            issueCount: (intent.issues || []).length,
           }});
           for (const src of intent.from) {
             edges.push({ data: { id: `${intent.id}_${src}`, source: src, target: phId, intentId: intent.id, label: lbl, status: nodeType }});
@@ -2199,6 +2244,11 @@ function cairnApp() {
       rawCy.on('tap', 'node', e => self.onNodeTap(e));
       rawCy.on('tap', 'edge', e => self.onEdgeTap(e));
       rawCy.on('tap', e => { if (e.target === rawCy) self.clearSelection(); });
+      this.issueTip = null;
+      rawCy.on('mouseover', 'node[issueCount > 0]', e => self.showIssueTip(e));
+      rawCy.on('mouseout', 'node[issueCount > 0]', () => self.hideIssueTip());
+      rawCy.on('viewport grab', () => self.hideIssueTip());
+      container.onmouseleave = () => self.hideIssueTip(); // the pointer can leave the canvas from a node
       this.pulseActive();
       this.setupAutoFit();
     },
@@ -2213,6 +2263,8 @@ function cairnApp() {
         { selector: 'node[nodeType="unclaimed"]', style: { ...common, shape:'ellipse','background-color':'#cbd5e1','background-opacity':0.5,label:'?',color:'#94a3b8','font-size':'11px','font-weight':'bold',width:20,height:20,'border-width':1.5,'border-color':'#94a3b8','border-style':'dashed' }},
         { selector: 'node[nodeType="bootstrap_pending"]', style: { ...common, shape:'round-rectangle','background-color':'#fff7ed','background-opacity':0.96,label:'data(label)',color:'#c2410c','font-size':'10px','font-weight':'bold',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#fdba74','border-style':'dashed','text-wrap':'wrap','text-max-width':'70px' }},
         { selector: 'node[nodeType="bootstrap_running"]', style: { ...common, shape:'round-rectangle','background-color':'#fb923c','background-opacity':0.96,label:'data(label)',color:'#fff7ed','font-size':'10px','font-weight':'bold',width:'data(width)',height:'data(height)','border-width':2,'border-color':'#ea580c','text-wrap':'wrap','text-max-width':'70px' }},
+
+        { selector: 'node[issueCount > 0]', style: { 'background-image':this.issueBadgeImage(),'background-width':'14px','background-height':'14px','background-position-x':'100%','background-position-y':'0%','background-offset-x':'6px','background-offset-y':'-6px','background-clip':'none','background-image-containment':'over','bounds-expansion':8 }},
 
         { selector: 'edge[status="concluded"]', style: { width:2,'line-color':'#6ee7b7','target-arrow-color':'#6ee7b7','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#94a3b8','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'80px','text-wrap':'ellipsis','text-background-color':'#f8fafc','text-background-opacity':0.85,'text-background-padding':'2px','text-events':'yes','arrow-scale':0.9 }},
         { selector: 'edge[status="in_progress"]', style: { width:2,'line-color':'#fbbf24','line-style':'dashed','line-dash-pattern':[8,4],'line-dash-offset':0,'target-arrow-color':'#fbbf24','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#b45309','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'80px','text-wrap':'ellipsis','text-background-color':'#fffbeb','text-background-opacity':0.85,'text-background-padding':'2px','text-events':'yes','arrow-scale':0.9 }},
@@ -2379,6 +2431,8 @@ function cairnApp() {
           ex.data('height') !== n.data.height
         ) {
           ex.data(n.data); changed = true;
+        } else if (ex.data('issueCount') !== n.data.issueCount) {
+          ex.data(n.data); // badge only: no new layout
         }
       }
       for (const e of edges) {
@@ -2392,8 +2446,67 @@ function cairnApp() {
         }
       }
       if (changed) this.cy.layout(this.layoutOpts()).run();
+      if (this.issueTip) {
+        const tipNode = this.cy.getElementById(this.issueTip.nodeId);
+        if (tipNode.length === 0 || !(tipNode.data('issueCount') > 0)) this.hideIssueTip();
+      }
       this.pulseActive();
       this.refreshGraphDecorations();
+    },
+
+    issueBadgeImage() {
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">'
+        + '<circle cx="8" cy="8" r="7.2" fill="#f59e0b" stroke="#ffffff" stroke-width="1.6"/>'
+        + '<rect x="7.1" y="3.5" width="1.8" height="5.8" rx="0.9" fill="#ffffff"/>'
+        + '<circle cx="8" cy="11.7" r="1.1" fill="#ffffff"/></svg>';
+      return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+    },
+
+    nodeIssues(nodeData) {
+      if (!this.project) return [];
+      const intent = nodeData.intentId
+        ? this.project.intents.find(i => i.id === nodeData.intentId)
+        : this.getProducingIntent(nodeData.id);
+      return (intent && intent.issues) || [];
+    },
+
+    showIssueTip(e) {
+      const issues = this.nodeIssues(e.target.data());
+      if (!issues.length) return;
+      const latest = issues[0];
+      const pointer = e.originalEvent || {};
+      this.issueTip = {
+        nodeId: e.target.id(),
+        x: Math.max(8, Math.min((pointer.clientX || 0) + 14, window.innerWidth - 336)),
+        y: Math.max(8, Math.min((pointer.clientY || 0) + 14, window.innerHeight - 160)),
+        title: this.issueTitle(latest),
+        lines: [...this.issueLines(latest), this.formatTime(latest.created_at)],
+        more: issues.length > 1 ? `+${issues.length - 1} more · click for details` : '',
+      };
+    },
+
+    hideIssueTip() {
+      this.issueTip = null;
+    },
+
+    issueTitle(issue) {
+      if (issue.kind === 'json_repaired') return 'JSON output repaired';
+      return String(issue.kind || 'issue').replace(/_/g, ' ');
+    },
+
+    issueLines(issue) {
+      const detail = issue.detail || {};
+      if (issue.kind === 'json_repaired') {
+        const how = {
+          lenient_decode: 'Raw line breaks in the text were accepted as they are.',
+          envelope_repair: 'Quotes or other characters that broke the JSON were kept as text.',
+        };
+        const lines = [how[detail.strategy] || `Strategy: ${detail.strategy}`];
+        lines.push('The fact text is the worker\'s own text, unchanged.');
+        if (detail.error) lines.push(`Strict parse error: ${detail.error}`);
+        return lines;
+      }
+      return Object.entries(detail).map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`);
     },
 
     pulseActive() {

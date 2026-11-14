@@ -6,6 +6,7 @@ import time
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
 from cairn.dispatcher.contracts import (
     EXPLORE_TEXT_ENVELOPE,
+    RescueReport,
     parse_json_output,
     parse_validated,
     validate_explore_payload,
@@ -350,6 +351,7 @@ def _try_conclude_fallback(
         )
         best_effort_release(client, project_id, intent.id, worker.name)
         return "failed"
+    rescue = RescueReport()
     try:
         model_output = driver.extract_response_text(result.stdout, result.stderr)
         kind, description = parse_validated(
@@ -357,6 +359,7 @@ def _try_conclude_fallback(
             validate_explore_payload,
             envelope=EXPLORE_TEXT_ENVELOPE,
             context=f"phase=explore_conclude project={project_id} intent={intent.id} worker={worker.name}",
+            on_rescue=rescue,
         )
     except Exception as exc:
         LOG.warning(
@@ -390,6 +393,7 @@ def _try_conclude_fallback(
         description,
         source="explore_conclude",
         phase_ms=conclude_ms,
+        parse_repair=rescue.parse_repair,
     )
 
 

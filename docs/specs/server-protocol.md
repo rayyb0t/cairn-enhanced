@@ -137,6 +137,7 @@ worker          # 执行者标识，语义随状态变化（见下方说明）
 last_heartbeat_at  # 最后一次心跳时间，仅尚无结论时有意义，永久保留，不清空
 created_at
 concluded_at    # 结论时间，null 表示尚无结论
+issues          # 运行中出现的问题（只读，最新在前），无问题时为空数组
 ```
 
 `creator` 在创建时写入，标识谁洞察局势提出了这个探索方向，不可变。`worker` 可为空；若创建时同时认领，则 `worker` 必须等于 `creator`，并写入首个 `last_heartbeat_at`。
@@ -155,6 +156,8 @@ concluded_at    # 结论时间，null 表示尚无结论
 | 已结论                | 产出结论的消费者，永久保留       |
 
 超时清空 worker 只针对尚无结论的 Intent。已结论的 Intent 不参与超时逻辑，worker 永久保留为产出结论的消费者标识。
+
+**issues 字段：** 只读的追加字段，记录该 Intent 运行中出现、需要在界面上提示的问题（界面上显示为提示图标；已结论的 Intent 显示在其产出的 Fact 节点上）。每条包含 `id`、`kind`、`run_id`（目前恒为 `null`）、`detail`（对象）、`created_at`、`updated_at`。目前只有一种 `kind`：`json_repaired`，表示 conclude 的输出在严格解析失败后经保守修复才解析成功，`detail` 为 `{"strategy": "lenient_decode" | "envelope_repair", "error": "<严格解析的错误>"}`，由 conclude 请求的可选字段 `parse_repair` 写入。`issues` 不参与导出（YAML 与 timeline 都不含），因此不会进入消费者读取的图快照。不认识该字段的客户端可直接忽略。
 
 ### Hint
 
@@ -547,6 +550,8 @@ Body：
 }
 ```
 
+可选字段 `parse_repair`：消费者在 conclude 输出经 JSON 修复才解析成功时附带，例如 `{"strategy": "envelope_repair", "error": "accepted must be true or false"}`。服务端在同一事务内把它记录为该 Intent 的一条 `json_repaired` issue（`error` 截断到 300 字符）。该字段只作记录，不影响结论：值无法识别时直接忽略，不返回 422；记录失败只回滚这条记录并写日志，Fact 与结论照常提交。不带该字段时行为与之前完全相同。
+
 响应：
 
 ```json
@@ -564,7 +569,8 @@ Body：
     "worker": "agent-B",
     "last_heartbeat_at": "2026-03-21T10:05:00Z",
     "created_at": "2026-03-21T10:03:00Z",
-    "concluded_at": "2026-03-21T10:05:00Z"
+    "concluded_at": "2026-03-21T10:05:00Z",
+    "issues": []
   }
 }
 ```
@@ -654,7 +660,7 @@ Body：
 
 #### GET /projects/{project_id}/export?format=yaml
 
-返回项目图的 YAML 结构化快照，供消费者读取。不含 `last_heartbeat_at`。尚无结论的 Intent（`to=null`）出现在 YAML 中，`worker` 字段直接反映当前是否有消费者在处理。`project.reason` 不在导出中出现，因为它是项目级协调状态，不属于事实图。读取时服务端仍会执行超时清理，因此导出结果反映的是清理后的当前状态。`created_at` 和 `concluded_at` 按服务端当前时区格式化为 `YYYY-MM-DD HH:mm:ss`。
+返回项目图的 YAML 结构化快照，供消费者读取。不含 `last_heartbeat_at`。尚无结论的 Intent（`to=null`）出现在 YAML 中，`worker` 字段直接反映当前是否有消费者在处理。`project.reason` 不在导出中出现，因为它是项目级协调状态，不属于事实图；Intent 的 `issues` 同样不在导出中出现。读取时服务端仍会执行超时清理，因此导出结果反映的是清理后的当前状态。`created_at` 和 `concluded_at` 按服务端当前时区格式化为 `YYYY-MM-DD HH:mm:ss`。
 
 ```yaml
 project:

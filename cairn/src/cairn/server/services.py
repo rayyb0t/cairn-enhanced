@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 
-from cairn.server.models import Intent, ProjectMeta, ProjectReason
+from cairn.server.models import Intent, IntentIssue, ProjectMeta, ProjectReason
+
+LOG = logging.getLogger(__name__)
+
+JSON_REPAIRED = "json_repaired"
+# The strategies of the dispatcher's JSON rescue (cairn.dispatcher.output_parser.rescue_text_envelope).
+JSON_REPAIR_STRATEGIES = frozenset({"lenient_decode", "envelope_repair"})
+_ISSUE_ERROR_MAX_CHARS = 300
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -147,11 +159,18 @@ def get_completion_intent_or_409(conn: sqlite3.Connection, project_id: str) -> s
     return rows[0]
 
 
-def intent_to_model(conn: sqlite3.Connection, row: sqlite3.Row, project_id: str) -> Intent:
+def intent_to_model(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    project_id: str,
+    issues: list[IntentIssue] | None = None,
+) -> Intent:
     sources = conn.execute(
         "SELECT fact_id FROM intent_sources WHERE intent_id = ? AND project_id = ? ORDER BY rowid",
         (row["id"], project_id),
     ).fetchall()
+    if issues is None:
+        issues = load_intent_issues(conn, project_id, row["id"]).get(row["id"], [])
     return Intent(
         id=row["id"],
         **{"from": [s["fact_id"] for s in sources]},
@@ -162,6 +181,7 @@ def intent_to_model(conn: sqlite3.Connection, row: sqlite3.Row, project_id: str)
         last_heartbeat_at=row["last_heartbeat_at"],
         created_at=row["created_at"],
         concluded_at=row["concluded_at"],
+        issues=issues,
     )
 
 
@@ -170,7 +190,108 @@ def build_intents(conn: sqlite3.Connection, project_id: str) -> list[Intent]:
         "SELECT * FROM intents WHERE project_id = ? ORDER BY created_at",
         (project_id,),
     ).fetchall()
-    return [intent_to_model(conn, r, project_id) for r in rows]
+    issues = load_intent_issues(conn, project_id)
+    return [intent_to_model(conn, r, project_id, issues.get(r["id"], [])) for r in rows]
+
+
+def json_repair_detail(value: Any) -> dict[str, str] | None:
+    """The detail of a json_repaired issue for a conclude's parse_repair value, or None to record none.
+
+    The dispatcher sends {"strategy": ..., "error": ...}. Anything this server does not understand is
+    ignored rather than refused, so the optional field can never make a conclude fail.
+    """
+    if not isinstance(value, dict):
+        return None
+    strategy = value.get("strategy")
+    if not isinstance(strategy, str) or strategy not in JSON_REPAIR_STRATEGIES:
+        return None
+    detail = {"strategy": strategy}
+    error = value.get("error")
+    if isinstance(error, str) and error.strip():
+        detail["error"] = error.strip()[:_ISSUE_ERROR_MAX_CHARS]
+    return detail
+
+
+def record_intent_issue(
+    conn: sqlite3.Connection,
+    project_id: str,
+    intent_id: str,
+    kind: str,
+    detail: dict[str, Any],
+    now: str,
+    run_id: str | None = None,
+) -> bool:
+    """Insert an issue without ever changing the outcome of the request that records it.
+
+    The insert runs in a savepoint. If it fails, only the savepoint is rolled back and the error is
+    logged, so the rest of the request's transaction (for a conclude, the fact) still commits.
+    """
+    conn.execute("SAVEPOINT record_intent_issue")
+    try:
+        conn.execute(
+            "INSERT INTO intent_issues (project_id, intent_id, run_id, kind, detail_json, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (project_id, intent_id, run_id, kind, json.dumps(detail, ensure_ascii=False), now, now),
+        )
+    except Exception:
+        if not conn.in_transaction:
+            raise  # the error ended the whole transaction, so the request cannot succeed either
+        conn.execute("ROLLBACK TO SAVEPOINT record_intent_issue")
+        conn.execute("RELEASE SAVEPOINT record_intent_issue")
+        LOG.warning(
+            "intent issue not recorded project=%s intent=%s kind=%s", project_id, intent_id, kind, exc_info=True
+        )
+        return False
+    conn.execute("RELEASE SAVEPOINT record_intent_issue")
+    return True
+
+
+def load_intent_issues(
+    conn: sqlite3.Connection, project_id: str, intent_id: str | None = None
+) -> dict[str, list[IntentIssue]]:
+    """Issues by intent id, newest first, for one intent or the whole project.
+
+    Reading them never fails the request: on a database error the issues are left out and the error is
+    logged, and a row this server cannot read is skipped.
+    """
+    query = "SELECT * FROM intent_issues WHERE project_id = ?"
+    params: tuple = (project_id,)
+    if intent_id is not None:
+        query += " AND intent_id = ?"
+        params = (project_id, intent_id)
+    in_transaction = conn.in_transaction
+    try:
+        rows = conn.execute(query + " ORDER BY id DESC", params).fetchall()
+    except sqlite3.Error:
+        if in_transaction and not conn.in_transaction:
+            raise  # the error ended the request's transaction, so the request cannot succeed either
+        LOG.warning("intent issues not loaded project=%s", project_id, exc_info=True)
+        return {}
+    issues: dict[str, list[IntentIssue]] = {}
+    for row in rows:
+        issue = _issue_from_row(row)
+        if issue is not None:
+            issues.setdefault(row["intent_id"], []).append(issue)
+    return issues
+
+
+def _issue_from_row(row: sqlite3.Row) -> IntentIssue | None:
+    try:
+        detail = json.loads(row["detail_json"])
+    except (TypeError, ValueError):
+        detail = None
+    try:
+        return IntentIssue(
+            id=row["id"],
+            kind=row["kind"],
+            run_id=row["run_id"],
+            detail=detail if isinstance(detail, dict) else {},
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+    except ValidationError:
+        LOG.warning("intent issue skipped id=%s", row["id"])
+        return None
 
 
 def get_intent_timeout(conn: sqlite3.Connection) -> int:

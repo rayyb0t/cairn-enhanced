@@ -297,6 +297,7 @@ def complete_project(project_id: str, body: CompleteRequest):
             last_heartbeat_at=now,
             created_at=now,
             concluded_at=now,
+            issues=[],
         )
 
 
