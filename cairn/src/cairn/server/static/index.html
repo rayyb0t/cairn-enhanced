@@ -412,6 +412,10 @@
       <span class="px-1.5 py-0.5 rounded-full text-[9px] font-semibold uppercase tracking-[0.12em] shrink-0"
         :class="projectStatusBadgeClass(project.project.status)"
         x-text="project.project.status"></span>
+      <template x-if="project.project.repair_enabled && !replay.active">
+        <span class="px-1.5 py-0.5 rounded-full border border-slate-200 bg-white text-[9px] font-semibold uppercase tracking-[0.12em] text-slate-500 shrink-0"
+          title="Repair is on in shadow mode: the repair agent records a decision for each long explore and nothing is applied. The Repair button turns it off.">Repair · shadow</span>
+      </template>
     </div>
     <div class="flex-1"></div>
     <div class="flex items-center gap-4 text-xs text-slate-400">
@@ -465,6 +469,18 @@
           class="px-2.5 py-1 rounded-lg border border-sky-200 text-xs text-sky-600 hover:bg-sky-50 transition flex items-center gap-1.5">
           <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 3v6h6"/></svg>
           Reopen
+        </button>
+      </template>
+      <template x-if="!replay.active">
+        <button type="button" data-repair-button @click="repairButtonClick($event)" @keydown.enter="repairButtonKeydown($event)"
+          :aria-pressed="project.project.repair_enabled ? 'true' : 'false'"
+          :title="repairButtonTitle()"
+          class="px-2.5 py-1 rounded-lg border text-xs transition flex items-center gap-1.5" style="white-space: nowrap"
+          :class="project.project.repair_enabled
+            ? 'border-brand-200 bg-brand-50 text-brand-600 hover:bg-brand-100'
+            : 'border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-slate-700'">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle x-show="project.project.repair_enabled" cx="12" cy="12" r="3.5" fill="currentColor" stroke="none"/></svg>
+          <span x-text="repairButtonLabel()"></span>
         </button>
       </template>
       <button x-show="!replay.active" @click="deleteProject()" class="px-2.5 py-1 rounded-lg border border-rose-200 text-xs text-rose-500 hover:bg-rose-50 hover:text-rose-600 transition flex items-center gap-1.5">
@@ -689,9 +705,10 @@
                       <template x-for="issue in selectedFactProducingIntent().issues" :key="issue.id">
                         <div class="rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 space-y-1">
                           <p class="font-semibold text-amber-700" x-text="issueTitle(issue)"></p>
-                          <template x-for="(line, index) in issueLines(issue)" :key="index">
+                          <template x-for="(line, index) in issueLines(issue, false, false)" :key="index">
                             <p class="text-slate-600 break-words" x-text="line"></p>
                           </template>
+                          <template x-if="issue.run_id"><p class="text-slate-400 font-mono" x-text="`run ${String(issue.run_id).slice(0, 12)}`"></p></template>
                           <p class="text-slate-400" x-text="formatTime(issue.created_at)"></p>
                         </div>
                       </template>
@@ -729,9 +746,10 @@
                     <template x-for="issue in selectedIntentRecord().issues" :key="issue.id">
                       <div class="rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 space-y-1">
                         <p class="font-semibold text-amber-700" x-text="issueTitle(issue)"></p>
-                        <template x-for="(line, index) in issueLines(issue)" :key="index">
+                        <template x-for="(line, index) in issueLines(issue, false, selectedIntentRecord().to == null)" :key="index">
                           <p class="text-slate-600 break-words" x-text="line"></p>
                         </template>
+                        <template x-if="issue.run_id"><p class="text-slate-400 font-mono" x-text="`run ${String(issue.run_id).slice(0, 12)}`"></p></template>
                         <p class="text-slate-400" x-text="formatTime(issue.created_at)"></p>
                       </div>
                     </template>
@@ -841,6 +859,11 @@
       <label class="flex items-center gap-2 px-1 text-sm text-slate-600">
         <input type="checkbox" x-model="newProject.bootstrap" class="h-4 w-4 rounded border-slate-300 text-brand-500 focus:ring-brand-200">
         <span>Run bootstrap attempt</span>
+      </label>
+      <label class="flex items-center gap-2 px-1 text-sm text-slate-600" title="Repair in shadow mode: each review sends a digest of the run to the reviewer set in dispatch.yaml.">
+        <input type="checkbox" x-model="newProject.repair" class="h-4 w-4 rounded border-slate-300 text-brand-500 focus:ring-brand-200">
+        <span>Repair long explores</span>
+        <span class="text-[11px] text-slate-400">shadow: decisions are recorded, not applied</span>
       </label>
 
       <div>
@@ -1139,7 +1162,7 @@ function cairnApp() {
     exportProjectId: '',
     showDeleteModal: false,
 
-    newProject: { title: '', origin: '', goal: '', bootstrap: true, hints: [{ content: '' }] },
+    newProject: { title: '', origin: '', goal: '', bootstrap: true, repair: false, hints: [{ content: '' }] },
     intentForm: { description: '' },
     concludeForm: { description: '', intentId: '' },
     completeForm: { description: '' },
@@ -1170,6 +1193,8 @@ function cairnApp() {
     projectListScrollTop: 0,
     shouldRestoreProjectListScroll: false,
     isStoppingAllProjects: false,
+    repairArmedFor: null,
+    repairArmTimer: null,
 
     async init() {
       this._panelResizeMove = (e) => this.onPanelResize(e);
@@ -1669,6 +1694,59 @@ function cairnApp() {
       if (reload) await this.loadProjects();
       if (toast) this.showToast(status === 'stopped' ? 'Project stopped' : 'Project resumed');
       return updated;
+    },
+
+    // The Repair button (shadow mode): a first click arms it and a second, separate click within 3 s switches, armed
+    // per project and target state. Its label never wraps, or arming would grow the header and setupAutoFit would
+    // refit the graph. The nowrap is an inline style: a class no other rendered element has (whitespace-nowrap) would
+    // make the Tailwind CDN rebuild on every project. A known limitation: the button takes header room, so in a narrow
+    // window the title group's badges overflow onto the counters below a width about 85 px greater than on the base
+    // page (about 200 px with the chip, more while armed); an icon-only label would only narrow that band.
+    repairButtonArmed() {
+      const p = this.project?.project;
+      return !!p && this.repairArmedFor === `${p.id}:${!p.repair_enabled}`;
+    },
+
+    repairButtonLabel() {
+      if (!this.repairButtonArmed()) return 'Repair';
+      return this.project.project.repair_enabled ? 'Click again to turn off' : 'Click again to turn on';
+    },
+
+    repairButtonTitle() {
+      return this.project?.project?.repair_enabled
+        ? 'Repair is on in shadow mode: the repair agent reviews each long explore of this project and nothing is applied. Click twice to turn it off.'
+        : 'Repair is off for this project. Click twice to turn it on: the repair agent then reviews each long explore in shadow mode, nothing is applied, and each review sends a digest of the run to the reviewer set in dispatch.yaml.';
+    },
+
+    repairButtonClick(event) {
+      // One gesture is one click: the second and later clicks of a double- or triple-click (detail 2, 3) never
+      // confirm, so the armed label is always seen before a separate confirming click. Keyboard activation has
+      // detail 0; a held Enter key is stopped at its repeated keydowns (repairButtonKeydown).
+      if (event && event.detail > 1) return;
+      const p = this.project?.project;
+      if (!p) return;
+      const key = `${p.id}:${!p.repair_enabled}`;
+      clearTimeout(this.repairArmTimer);
+      if (this.repairArmedFor !== key) {
+        this.repairArmedFor = key;
+        this.repairArmTimer = setTimeout(() => { this.repairArmedFor = null; }, 3000);
+        return;
+      }
+      this.repairArmedFor = null;
+      this.setProjectRepair(p.id, !p.repair_enabled);
+    },
+
+    repairButtonKeydown(event) {
+      // A held Enter key repeats its keydown, and each repeat would click the button again: only the first counts.
+      if (event.repeat) event.preventDefault();
+    },
+
+    async setProjectRepair(projectId, enabled) {
+      try {
+        const updated = await this.api('PUT', `/projects/${projectId}/repair`, { enabled });
+        if (this.project?.project?.id === updated.id) this.project.project.repair_enabled = updated.repair_enabled;
+        this.showToast(updated.repair_enabled ? 'Repair turned on (shadow)' : 'Repair turned off');
+      } catch (e) { this.showToast(e.message, 'error'); }
     },
 
     async stopAllActiveProjects() {
@@ -2265,6 +2343,7 @@ function cairnApp() {
         { selector: 'node[nodeType="bootstrap_running"]', style: { ...common, shape:'round-rectangle','background-color':'#fb923c','background-opacity':0.96,label:'data(label)',color:'#fff7ed','font-size':'10px','font-weight':'bold',width:'data(width)',height:'data(height)','border-width':2,'border-color':'#ea580c','text-wrap':'wrap','text-max-width':'70px' }},
 
         { selector: 'node[issueCount > 0]', style: { 'background-image':this.issueBadgeImage(),'background-width':'14px','background-height':'14px','background-position-x':'100%','background-position-y':'0%','background-offset-x':'6px','background-offset-y':'-6px','background-clip':'none','background-image-containment':'over','bounds-expansion':8 }},
+        { selector: 'node[issueCount > 0][nodeType="in_progress"]', style: { 'background-image': this.issueBadgeImage('#92400e') }},
 
         { selector: 'edge[status="concluded"]', style: { width:2,'line-color':'#6ee7b7','target-arrow-color':'#6ee7b7','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#94a3b8','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'80px','text-wrap':'ellipsis','text-background-color':'#f8fafc','text-background-opacity':0.85,'text-background-padding':'2px','text-events':'yes','arrow-scale':0.9 }},
         { selector: 'edge[status="in_progress"]', style: { width:2,'line-color':'#fbbf24','line-style':'dashed','line-dash-pattern':[8,4],'line-dash-offset':0,'target-arrow-color':'#fbbf24','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#b45309','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'80px','text-wrap':'ellipsis','text-background-color':'#fffbeb','text-background-opacity':0.85,'text-background-padding':'2px','text-events':'yes','arrow-scale':0.9 }},
@@ -2454,9 +2533,9 @@ function cairnApp() {
       this.refreshGraphDecorations();
     },
 
-    issueBadgeImage() {
+    issueBadgeImage(fill = '#f59e0b') {
       const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">'
-        + '<circle cx="8" cy="8" r="7.2" fill="#f59e0b" stroke="#ffffff" stroke-width="1.6"/>'
+        + `<circle cx="8" cy="8" r="7.2" fill="${fill}" stroke="#ffffff" stroke-width="1.6"/>`
         + '<rect x="7.1" y="3.5" width="1.8" height="5.8" rx="0.9" fill="#ffffff"/>'
         + '<circle cx="8" cy="11.7" r="1.1" fill="#ffffff"/></svg>';
       return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
@@ -2475,14 +2554,35 @@ function cairnApp() {
       if (!issues.length) return;
       const latest = issues[0];
       const pointer = e.originalEvent || {};
+      const intentOpen = String(e.target.id()).startsWith('_ph_');
+      const lines = [...this.issueLines(latest, true, intentOpen), this.formatTime(latest.created_at)];
       this.issueTip = {
         nodeId: e.target.id(),
         x: Math.max(8, Math.min((pointer.clientX || 0) + 14, window.innerWidth - 336)),
-        y: Math.max(8, Math.min((pointer.clientY || 0) + 14, window.innerHeight - 160)),
+        y: Math.max(8, Math.min((pointer.clientY || 0) + 14, window.innerHeight - Math.max(160, 40 + 20 * lines.length))),
         title: this.issueTitle(latest),
-        lines: [...this.issueLines(latest), this.formatTime(latest.created_at)],
+        lines,
         more: issues.length > 1 ? `+${issues.length - 1} more · click for details` : '',
       };
+      // A review's lines wrap, so the estimate above can fall short of the tip's height near the bottom edge: once
+      // the tip is drawn, move it up by what it still overflows. Other tips (json_repaired) keep today's position.
+      if (latest.kind === 'repair_review') {
+        const tip = this.issueTip;
+        this.$nextTick(() => this.keepIssueTipInView(tip));
+      }
+    },
+
+    keepIssueTipInView(tip, tries = 3) {
+      if (!tip || this.issueTip !== tip) return;
+      const el = document.querySelector('div[x-show="issueTip"]');
+      if (!el) return;
+      if (!el.offsetHeight) {
+        // x-show reveals the tip in an animation frame: measure once it is shown.
+        if (tries > 0) requestAnimationFrame(() => this.keepIssueTipInView(tip, tries - 1));
+        return;
+      }
+      const y = Math.max(8, Math.min(tip.y, window.innerHeight - el.offsetHeight - 8));
+      if (y !== tip.y) tip.y = y;
     },
 
     hideIssueTip() {
@@ -2491,10 +2591,18 @@ function cairnApp() {
 
     issueTitle(issue) {
       if (issue.kind === 'json_repaired') return 'JSON output repaired';
+      if (issue.kind === 'repair_review') {
+        const d = issue.detail || {};
+        if (d.decision === 'extend') return Number(d.slice_seconds) > 0 ? `Repair review: extend +${this.repairDuration(d.slice_seconds)}` : 'Repair review: extend';
+        if (d.decision === 'detach') return 'Repair review: detach';
+        if (d.decision === 'continue') return 'Repair review: continue';
+        if (d.decision === 'not_reviewed') return 'Repair review: not reviewed';
+        return 'Repair review';
+      }
       return String(issue.kind || 'issue').replace(/_/g, ' ');
     },
 
-    issueLines(issue) {
+    issueLines(issue, compact = false, intentOpen = false) {
       const detail = issue.detail || {};
       if (issue.kind === 'json_repaired') {
         const how = {
@@ -2506,7 +2614,57 @@ function cairnApp() {
         if (detail.error) lines.push(`Strict parse error: ${detail.error}`);
         return lines;
       }
+      if (issue.kind === 'repair_review') return this.repairReviewLines(detail, compact, intentOpen);
       return Object.entries(detail).map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`);
+    },
+
+    // The lines of a repair_review issue (shadow mode), in a fixed order, each only when its field is present.
+    // compact: the hover tooltip (texts cut, at most 2 evidence items, no model). intentOpen: the issue is shown
+    // on an open intent, where a review of an ended attempt is marked as an earlier attempt.
+    repairReviewLines(d, compact = false, intentOpen = false) {
+      const present = value => value !== undefined && value !== null && value !== '';
+      // Cut by code points, as the server counts characters, so a cut never splits a surrogate pair (an emoji).
+      const cut = (text, max) => {
+        if (!compact || text.length <= max) return text;
+        const chars = Array.from(text);
+        return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : text;
+      };
+      const lines = [];
+      if (d.mode === 'shadow' || d.applied === false) lines.push('Shadow mode: recorded, not applied.');
+      // A run ended by its own process exit is still the current attempt until its outcome is stamped.
+      if (intentOpen && present(d.run_ended_at) && (present(d.outcome) || d.end_reason !== 'dispatcher')) {
+        lines.push(`Earlier attempt: that run ended ${this.formatTime(d.run_ended_at)}.`);
+      }
+      if (d.decision === 'not_reviewed' && d.why === 'agent_not_seen') lines.push('The repair agent was not running during the review window.');
+      if (d.decision === 'not_reviewed' && d.why === 'agent_seen') lines.push('The repair agent recorded no decision before the review window closed.');
+      if (present(d.fallback)) {
+        const fallbacks = {
+          model_timeout: 'the repair model timed out',
+          model_error: 'the repair model failed',
+          invalid_output: 'the repair model gave no valid answer',
+          transcript_unreadable: 'the transcript could not be read',
+          digest_error: 'the digest could not be built',
+        };
+        lines.push(`Automatic continue: ${fallbacks[d.fallback] || String(d.fallback)}.`);
+      }
+      if (typeof d.reason === 'string' && d.reason) lines.push(`Reason: ${cut(d.reason, 160)}`);
+      const evidence = Array.isArray(d.evidence) ? d.evidence.filter(item => typeof item === 'string' && item) : [];
+      for (const item of compact ? evidence.slice(0, 2) : evidence) lines.push(`• ${cut(item, 100)}`);
+      if (compact && evidence.length > 2) lines.push(`+${evidence.length - 2} more evidence`);
+      if (typeof d.next_step === 'string' && d.next_step) lines.push(`Next step: ${cut(d.next_step, 120)}`);
+      if (present(d.elapsed_seconds) && present(d.window_seconds)) {
+        const windowNumber = Number(d.window);
+        lines.push(`Time used: ${this.repairDuration(d.elapsed_seconds)} of ${this.repairDuration(d.window_seconds)}${windowNumber > 1 ? ` (window ${windowNumber})` : ''}`);
+      }
+      if (present(d.deadline_at)) lines.push(`Deadline: ${this.formatTime(d.deadline_at)}`);
+      if (!compact && present(d.model)) lines.push(`Model: ${d.model}`);
+      return lines;
+    },
+
+    repairDuration(seconds) {
+      const total = Math.max(0, Math.round(Number(seconds) || 0));
+      if (total >= 60 && total % 60 === 0) return `${total / 60} min`;
+      return this.formatDurationMs(total * 1000);
     },
 
     pulseActive() {
@@ -3383,11 +3541,12 @@ function cairnApp() {
           goal: this.newProject.goal,
           bootstrap_enabled: this.newProject.bootstrap
         };
+        if (this.newProject.repair) body.repair_enabled = true;
         const hints = hintContents.map(h => ({ content: h.content.trim(), creator: actor }));
         if (hints.length > 0) body.hints = hints;
         const data = await this.api('POST', '/projects', body);
         this.showNewProject = false;
-        this.newProject = { title:'', origin:'', goal:'', bootstrap: true, hints: [{ content:'' }] };
+        this.newProject = { title:'', origin:'', goal:'', bootstrap: true, repair: false, hints: [{ content:'' }] };
         await this.loadProjects();
         await this.openProject(data.project.id);
         this.showToast('Project created');
