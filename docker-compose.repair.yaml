@@ -1,0 +1,37 @@
+# Repair layer, shadow mode: an opt-in override; docker-compose.yaml itself is unchanged. Use both files together:
+#   docker compose -f docker-compose.yaml -f docker-compose.repair.yaml up -d --build
+# Before the first up, create every file mounted below (secrets/repair-agent.token, secrets/repair-dispatcher.token,
+# ./repair.compose.yaml) and add the repair: section to ./dispatch.yaml: tools/repair-phase2/README.md, steps 1-4.
+# The reviewers and their keys are in that repair: section only. This file mounts no key into the agent: it reads
+# them from the dispatcher's settings file in the copy root, which it mounts read-only.
+services:
+  cairn-server:
+    environment:
+      CAIRN_REPAIR_AGENT_TOKEN_FILE: /run/secrets/repair-agent.token
+      CAIRN_REPAIR_DISPATCHER_TOKEN_FILE: /run/secrets/repair-dispatcher.token
+    volumes:
+      - ./secrets/repair-agent.token:/run/secrets/repair-agent.token:ro
+      - ./secrets/repair-dispatcher.token:/run/secrets/repair-dispatcher.token:ro
+  cairn-dispatcher:
+    volumes:
+      - ./secrets/repair-dispatcher.token:/run/secrets/repair-dispatcher.token:ro
+      - ./datas/repair-transcripts:/var/lib/cairn-repair/transcripts
+  cairn-repair:
+    build:
+      context: ./repair-agent                 # never the repository root, which holds dispatch.yaml, secrets/ and datas/
+      dockerfile: Dockerfile
+    image: cairn-repair-agent
+    container_name: cairn-repair
+    depends_on:
+      cairn-server:
+        condition: service_healthy
+      cairn-dispatcher:
+        condition: service_started            # writes the agent's settings file at its start
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # a model server on the host
+    volumes:
+      - ./repair.compose.yaml:/repair-agent/repair.yaml:ro
+      - ./secrets/repair-agent.token:/run/secrets/repair-agent.token:ro
+      - ./datas/repair-transcripts:/var/lib/cairn-repair/transcripts:ro
+    command: ["cairn-repair", "--config", "/repair-agent/repair.yaml"]
