@@ -39,6 +39,8 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from .digest import MIN_DIGEST_TOKENS, context_window_room
+
 logger = logging.getLogger(__name__)
 
 SETTINGS_FILE_NAME = "agent-settings.json"
@@ -615,6 +617,16 @@ def parse_settings(raw: Any, path: str) -> AgentSettings:
         seen.add(reviewer.name)
         if reviewer.ca_bundle is not None and not _readable_file(reviewer.ca_bundle):
             raise invalid(f"reviewers[{index}].ca_bundle", f"reviewer {reviewer.name}: {SETTINGS_RULES['ca_bundle']}")
+        if reviewer.context_window is not None:
+            # Appendix C-1, Digest budget: below this, the size ladder drops most of the evidence the system prompt
+            # asks the model to weigh. The numbers are the reviewer's own settings, not secrets.
+            room = context_window_room(reviewer.context_window, reviewer.max_tokens)
+            if room < MIN_DIGEST_TOKENS:
+                raise invalid(
+                    f"reviewers[{index}].context_window",
+                    f"reviewer {reviewer.name}: context_window {reviewer.context_window} leaves {room} tokens for the "
+                    f"digest, at least {MIN_DIGEST_TOKENS} are needed; raise the server's context or lower max_tokens",
+                )
     return settings
 
 

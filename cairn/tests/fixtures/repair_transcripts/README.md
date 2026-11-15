@@ -104,6 +104,13 @@ nothing ever ends them. A `<task-notification>` ends a job only as the `content`
 `claudecode-2.1.98-autobackground.jsonl`), never inside a tool result: a parser that also reads tool results ends R
 at line 12, while R runs until line 14. No tool output in the other four Claude Code files imitates a notice, so
 those files cannot tell either pair of rules apart.
+Polls and exit codes are read from records too: a `TaskOutput` answer ends its job only through its record's
+`toolUseResult.task.status`, a `TaskStop` answer only through its record's `toolUseResult.task_id`, and a call's failure
+and exit code come from its record (`is_error`, `isError` for pi, or the header codex builds before `Output:`), never
+from what the command printed; spec §16's AG62–AG66 check this on in-memory edits of these files. Of the notification
+sources listed above, spec §9.5 reads a job's end only from the `queue-operation` enqueue and the `queued_command`
+attachment; the after-turn `type: "user"` record (line 17 of `claudecode-2.1.98-autobackground.jsonl`, line 12 of
+`claudecode-2.1.98-agent-background.jsonl`) ends nothing (spec §16 AG17).
 
 ## How they were made
 

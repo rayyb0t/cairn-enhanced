@@ -28,6 +28,7 @@ from .config import (
     read_agent_token,
     read_server_api_key,
 )
+from .digest import digest_budget
 
 if TYPE_CHECKING:
     from .model import ModelClient
@@ -118,7 +119,7 @@ def start(args: argparse.Namespace) -> StartedAgent:
         )
 
     # The digest budget; a reviewer's context_window lowers it (Appendix C-1, Digest budget).
-    digest_tokens = config.digest.max_tokens_estimate
+    digest_tokens = digest_budget(config.digest.max_tokens_estimate, reviewer.context_window, reviewer.max_tokens)
     logger.info(
         "repair agent started server=%s reviewer=%s model=%s endpoint=%s digest_tokens=%s poll=%ss projects=%s "
         "transcripts=%s dry_run=%s",
