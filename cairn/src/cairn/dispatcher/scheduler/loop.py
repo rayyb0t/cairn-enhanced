@@ -4,6 +4,7 @@ import logging
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,43 @@ UNHEALTHY_RETRY_AFTER_SECONDS = 5
 REJECTED_RETRY_AFTER_SECONDS = 5
 BOOTSTRAP_INTENT_DESCRIPTION = "bootstrap"
 BOOTSTRAP_INTENT_CREATOR = "dispatcher.bootstrap"
+_repair_module_failed = False
+
+
+def _explore_task_for(project: ProjectDetail) -> Callable[..., str]:
+    """Today's explore task, or its Repair version when the project's Repair switch is on.
+
+    Nothing under cairn.dispatcher.repair is imported until a project with the switch on is dispatched.
+    If that module cannot be loaded, every run uses today's explore task, logged once per process.
+    """
+    global _repair_module_failed
+    if getattr(project.project, "repair_enabled", False) is not True or _repair_module_failed:
+        return run_explore_task
+    try:
+        from cairn.dispatcher.repair.explore import run_explore_task_with_repair
+    except Exception:
+        _repair_module_failed = True
+        LOG.exception("repair module unavailable, running today's explore task project=%s", project.project.id)
+        return run_explore_task
+    return run_explore_task_with_repair
+
+
+def _start_repair_side(config: DispatchConfig) -> None:
+    """Start the repair side once, at dispatcher start, when dispatch.yaml has a repair: section.
+
+    Without that section this returns at once and imports nothing. With it, one daemon thread writes the
+    repair agent's settings file and removes the copies of deleted projects; nothing here raises.
+    If the repair module cannot be loaded or starting it raises, every run uses today's explore task, logged once per process.
+    """
+    global _repair_module_failed
+    if getattr(config, "repair", None) is None or _repair_module_failed:
+        return
+    try:
+        from cairn.dispatcher.repair.housekeeping import start_repair_side
+        start_repair_side(config)
+    except Exception:
+        _repair_module_failed = True
+        LOG.exception("repair module unavailable, running today's explore task project=%s", "-")
 
 
 @dataclass(slots=True)
@@ -79,6 +117,7 @@ class DispatcherLoop:
 
     def run(self, once: bool = False) -> None:
         try:
+            _start_repair_side(self.config)
             self.run_startup_healthchecks()
             while True:
                 try:
@@ -524,7 +563,7 @@ class DispatcherLoop:
             return False
         try:
             future = self.executor.submit(
-                run_explore_task,
+                _explore_task_for(project),
                 self.config,
                 self.client,
                 self.container_manager,

@@ -1,10 +1,18 @@
 """Dispatcher tests of spec 16 (DS ids) for the repair layer, Phase 2 (shadow mode).
 
-Build step 5 adds four of them: DS12 (hostile session ids never reach a body or a log record), DS21 (the token
-is read only from the configured file, once per process), DS22 (configuration errors are logged once per
-process) and DS27 (the repair: section of dispatch.yaml is optional and strict). Step 6 adds the others. Unit
-tests of the same modules that spec 16 does not number are in test_repair_dispatcher_{config,token,client,
-session_ids}.py, and the helpers these files share are in repair_dispatcher_support.py. Every value here is
+This file holds four of them, from build step 5: DS12 (hostile session ids never reach a body or a log record),
+DS21 (the token is read only from the configured file, once per process), DS22 (configuration errors are logged
+once per process) and DS27 (the repair: section of dispatch.yaml is optional and strict). Spec 8.2 and 16 name
+this file (with test_repair_transcripts.py) for the dispatcher tests; the DS tests of build step 6 are in three
+files beside it, by what they drive, each under the name spec 16 gives it:
+- test_repair_dispatcher_scheduler.py: DS1-DS4 and DS30, touch point (a) in scheduler/loop.py;
+- test_repair_dispatcher_shadow.py: DS5-DS8, DS10, DS11, DS13-DS20, DS23, DS24 and DS26, the pass-throughs and the
+  reporter thread;
+- test_repair_dispatcher_server.py: DS9 (= XC1) and DS25, against the real server (they skip in a tree without the
+  server's repair routes).
+DS28 and DS29 (the agent's settings file and the shared reviewer keys) are build step 7's. Unit tests of the same
+modules that spec 16 does not number are in test_repair_dispatcher_{config,token,client,session_ids}.py, and the
+helpers these files share are in repair_dispatcher_support.py and repair_dispatcher_runs.py. Every value here is
 synthetic: the tokens and keys are obviously fake, and the ids are only names.
 """
 
