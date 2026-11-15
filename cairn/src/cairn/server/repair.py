@@ -6,11 +6,11 @@ nothing here moves a deadline or changes how a run starts, runs or ends.
 
 This module holds the constants, the clock, the window maths, liveness, the sweep, the not-reviewed rule, the
 stamping of ended runs on their issues, the run views and the text cleaning. Only the repair endpoints call it,
-each inside its own `immediate_transaction`, which logs what the transaction wrote only once it has committed; no
-existing endpoint does. A run is deleted with its intent through the foreign key of `repair_runs`, and its reviews
-with it, by today's project delete and reopen, so the sweep has no orphan pass. Every read here joins a run with its
-intent and project, so a row whose intent is gone (possible only after a delete run outside Cairn with foreign keys
-off) is never read.
+each inside its own `immediate_transaction`, which logs what the transaction wrote only once it has committed (the
+listing then reads its runs in a second, read-only transaction); no existing endpoint does. A run is deleted with
+its intent through the foreign key of `repair_runs`, and its reviews with it, by today's project delete and reopen,
+so the sweep has no orphan pass. Every read here joins a run with its intent and project, so a row whose intent is
+gone (possible only after a delete run outside Cairn with foreign keys off) is never read.
 """
 
 from __future__ import annotations
@@ -435,11 +435,44 @@ _RUN_SELECT = (
 _FIND_RUN_SQL = _RUN_SELECT + " WHERE r.run_id = ?"
 # The sweep reads only open or unsettled runs, through the partial index repair_runs_attention.
 ATTENTION_SQL = _RUN_SELECT + " WHERE r.ended_at IS NULL OR r.settled_window = 0 ORDER BY r.started_at, r.run_id"
+# GET /repair/runs: the open runs of active projects whose switch is on, oldest start first (live_runs keeps those in a
+# listed state), and, for evaluation tools, every run, newest registration first, one page after a cursor.
+_LIVE_RUNS_SQL = _RUN_SELECT + (
+    " WHERE r.ended_at IS NULL AND p.status = 'active' AND p.repair_enabled != 0"
+    " AND (:project_id IS NULL OR r.project_id = :project_id)"
+    " ORDER BY r.started_at, r.run_id"
+)
+_RUNS_PAGE_SQL = _RUN_SELECT + (
+    " WHERE (:project_id IS NULL OR r.project_id = :project_id)"
+    " AND (:registered_at IS NULL OR r.registered_at < :registered_at"
+    " OR (r.registered_at = :registered_at AND r.run_id < :run_id))"
+    " ORDER BY r.registered_at DESC, r.run_id DESC LIMIT :limit"
+)
 
 
 def find_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
     """The run with its intent and project, or None: unknown, deleted, or its intent or project is missing."""
     return conn.execute(_FIND_RUN_SQL, (run_id,)).fetchone()
+
+
+def live_runs(conn: sqlite3.Connection, project_id: str | None, limit: int) -> list[sqlite3.Row]:
+    """The runs the agent reviews: open, of an active project whose switch is on, and in a state of LISTED_STATES, so
+    that the detached runs of Phase 4, which stay open, are not listed. Oldest start first, at most `limit`.
+    """
+    rows = conn.execute(_LIVE_RUNS_SQL, {"project_id": project_id}).fetchall()
+    return [row for row in rows if row["state"] in LISTED_STATES][:limit]
+
+
+def runs_page(
+    conn: sqlite3.Connection, project_id: str | None, limit: int, after: tuple[str, str] | None
+) -> list[sqlite3.Row]:
+    """Every run, ended ones included, whatever the switch, newest registration first: at most `limit` of them after
+    the (registered_at, run_id) of the previous page's last run.
+    """
+    registered_at, run_id = after if after is not None else (None, None)
+    return conn.execute(
+        _RUNS_PAGE_SQL, {"project_id": project_id, "registered_at": registered_at, "run_id": run_id, "limit": limit}
+    ).fetchall()
 
 
 def _intent_of(row: RowLike) -> dict[str, Any]:
@@ -824,6 +857,24 @@ def end_run(
 # --------------------------------------------------------------------------- agent reviews
 
 _DROPPED_CATEGORIES = frozenset({"Cc", "Cf"})
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
+REPLACEMENT_CHARACTER = "�"
+
+
+def replace_lone_surrogates(value: Any) -> Any:
+    """`value` with each lone surrogate in its strings, dict keys included, replaced by U+FFFD, one for one.
+
+    A JSON body may hold the escape of half a surrogate pair, such as \\ud83d: JSON.stringify writes one for a string
+    cut between the two halves, as a transcript excerpt can be. json.loads reads it back as a lone surrogate, which no
+    UTF-8 text can hold, so storing, hashing or answering with it would fail. Lengths do not change, so no limit does.
+    """
+    if isinstance(value, str):
+        return _LONE_SURROGATE.sub(REPLACEMENT_CHARACTER, value) if _LONE_SURROGATE.search(value) else value
+    if isinstance(value, dict):
+        return {replace_lone_surrogates(key): replace_lone_surrogates(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [replace_lone_surrogates(item) for item in value]
+    return value
 
 
 def clean_text(value: str | None) -> str:

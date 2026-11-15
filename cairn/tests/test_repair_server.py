@@ -1,5 +1,12 @@
 """Repair layer (shadow mode): the server tests of spec section 16 (the SV ids).
 
+This file holds the tests of the switch column, the project objects and the run lifecycle: SV1-SV5, SV7, SV9,
+SV23, SV24 and SV37-SV42. The tests of the repair endpoints, which drive them over HTTP, are in four files beside
+it: test_repair_server_auth.py (SV6, SV10-SV15, SV47), test_repair_server_runs.py (SV16-SV22, SV25, SV28-SV36),
+test_repair_server_existing.py (SV8, SV26, SV27, SV43, SV44, SV46) and test_repair_server_logs.py (SV45). They share
+test_repair_server_support.py, and SV43, SV44 and SV46 replay the existing-endpoint script of
+test_repair_server_script.py. Every test keeps its section 16 name.
+
 The switch column and the repair tables (SV1, SV2). Every existing database gets `projects.repair_enabled` only
 through the ALTER in `db._ensure_project_columns`, so these tests start from databases built without the column: a
 literal copy of the schema at ee0f227, the last server schema before the repair layer, and the two legacy
@@ -18,12 +25,12 @@ a short heartbeat gap does not end it, when a run that reached its limit unrevie
 record, and how an ended run is stamped on its issues. Supporting tests below them check an agent review's stored
 copy and display copy, the window maths and the run view, the liveness rules one by one, the text cleaning, the
 request models, the sweep's reads (no orphan pass), the not-reviewed rule applied once more after a late /end, the
-edges of /end, and that repair lines are logged only once their transaction commits. The repair endpoints come in a
-later step, so the run's side is driven through cairn.server.repair (insert_run, sweep, end_run, record_agent_review,
-run_view), each call in its own BEGIN IMMEDIATE transaction as an endpoint would make it. The intent's side is
-driven through today's endpoints (heartbeat, release, conclude, status, complete, the project read), which set the
-claims and statuses the sweep reads; the many keep-alive heartbeats call the heartbeat endpoint's own function, the
-other calls go over HTTP.
+edges of /end, and that repair lines are logged only once their transaction commits. These tests drive the run's
+side through cairn.server.repair itself (insert_run, sweep, end_run, record_agent_review, run_view), each call in its
+own BEGIN IMMEDIATE transaction as an endpoint makes it, so the rules are tested apart from the endpoints. The intent's
+side is driven through today's endpoints (heartbeat, release, conclude, status, complete, the project read), which
+set the claims and statuses the sweep reads; the many keep-alive heartbeats call the heartbeat endpoint's own
+function, the other calls go over HTTP.
 
 The server fixture is test_server_api.py's, with the server's clock frozen: utcnow is patched in services,
 routers.intents, routers.projects, routers.hints and repair, and moves only when a test moves it.
@@ -922,7 +929,7 @@ def intent_of(server: TestClient, project_id: str, intent_id: str) -> dict[str, 
 
 
 def set_switch(project_id: str, enabled: bool) -> None:
-    """The project's Repair switch (its endpoint comes with the repair routes)."""
+    """The project's Repair switch, written directly (its endpoint is tested in test_repair_server_auth.py, SV6)."""
     with db.get_conn() as conn:
         conn.execute("UPDATE projects SET repair_enabled = ? WHERE id = ?", (int(enabled), project_id))
 

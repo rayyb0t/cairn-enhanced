@@ -2,7 +2,9 @@
 
 Request models ignore unknown fields, so a newer client works with this server, and refuse NaN and Infinity: FastAPI
 parses bodies with json.loads, which accepts them, and a stored one would make every later answer about that run
-fail. Every id rule is a full match. A body that fails its model gets FastAPI's own 422.
+fail. For the same reason, a lone surrogate (the escape of half a surrogate pair, such as \\ud83d, which json.loads
+also accepts) becomes U+FFFD in every string of a declared field before the field's rules apply; an unknown field is
+ignored, whatever it holds. Every id rule is a full match. A body that fails its model gets FastAPI's own 422.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from cairn.server.repair import (
     RAW_OUTPUT_MAX_CHARS,
     REASON_MAX_CHARS,
     clean_text,
+    replace_lone_surrogates,
 )
 
 # The largest budget, and so the bound of every number that enters time arithmetic.
@@ -45,6 +48,15 @@ def valid_run_id(value: str) -> bool:
 
 class _RepairRequest(BaseModel):
     model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def no_lone_surrogates(cls, value: Any) -> Any:
+        # Before the field's own rules: pydantic refuses a lone surrogate in every constrained field, so a digest holding
+        # one would be refused on every retry, with a 422 that could not even be written. Pydantic calls this for each
+        # field the model declares, and never for an unknown one, which stays ignored whatever it holds, as today's
+        # endpoints ignore it: also lists nested deeper than Python's recursion limit, which json.loads reads.
+        return replace_lone_surrogates(value)
 
 
 # --------------------------------------------------------------------------- requests
