@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 import json
+import os
+import re
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -204,6 +206,256 @@ class WorkerConfig(BaseModel):
         return self
 
 
+class RepairReviewerEnv(BaseModel):
+    """A reviewer's env in the repair: section (spec 8.3): only these three names, never common_env."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    REVIEW_MODEL: str = Field(min_length=1)
+    REVIEW_BASE_URL: str
+    REVIEW_API_KEY: str | None = Field(default=None, repr=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def hide_inputs(cls, data: Any) -> Any:
+        return RepairConfig.hidden(data)
+
+    @field_validator("REVIEW_MODEL", "REVIEW_BASE_URL")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return RepairConfig.refuse_placeholder(value)
+
+    @field_validator("REVIEW_BASE_URL")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("REVIEW_BASE_URL must start with http:// or https://")
+        return value
+
+    @field_validator("REVIEW_API_KEY", mode="before")
+    @classmethod
+    def empty_api_key_is_unset(cls, value: Any) -> Any:
+        return None if value == "" else value
+
+    @field_validator("REVIEW_API_KEY")
+    @classmethod
+    def validate_api_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        RepairConfig.refuse_placeholder(value)
+        if not (value.isascii() and value.isprintable()):
+            raise ValueError("REVIEW_API_KEY must be printable ASCII (0x20-0x7E)")
+        return value
+
+
+class RepairReviewerConfig(BaseModel):
+    """One entry of repair.reviewers (spec 8.3): written like a worker entry, but never a worker.
+
+    The optional settings are Appendix C-1's. Only their types are checked here; left out or null, the
+    repair agent applies C-1's default, and it checks the values at its start.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    env: RepairReviewerEnv
+    structured_output: bool | None = Field(default=None, strict=True)
+    max_tokens: int | None = Field(default=None, ge=1, strict=True)
+    context_window: int | None = Field(default=None, ge=1, strict=True)
+    timeout_seconds: int | None = Field(default=None, ge=1, strict=True)
+    max_attempts: int | None = Field(default=None, ge=1, strict=True)
+    ca_bundle: str | None = Field(default=None, min_length=1)
+    proxy: str | None = Field(default=None, min_length=1)
+    price: dict[str, Annotated[float, Field(strict=True, allow_inf_nan=False, ge=0)]] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def hide_inputs(cls, data: Any) -> Any:
+        return RepairConfig.hidden(data)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        # Printed in log lines and in the replay's report, so it has a rule; worker names have none.
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value) is None:
+            raise ValueError("reviewer name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+        return value
+
+    @field_validator("ca_bundle", "proxy")
+    @classmethod
+    def validate_text(cls, value: str | None) -> str | None:
+        return None if value is None else RepairConfig.refuse_placeholder(value)
+
+    @field_validator("price")
+    @classmethod
+    def validate_price(cls, value: dict[str, float] | None) -> dict[str, float] | None:
+        if value is not None and set(value) != {"input_per_mtok", "output_per_mtok"}:
+            raise ValueError("price must have exactly the keys input_per_mtok and output_per_mtok")
+        return value
+
+
+class RepairConfig(BaseModel):
+    """The optional repair: section of dispatch.yaml (spec 8.3; owner decision O1).
+
+    Parsing reads no file and makes no request: the token file is read later, once per process, by the
+    repair module, which loading dispatch.yaml never imports.
+
+    An error raised inside the section names the key and the rule, never a value. pydantic prints the offending
+    input next to the key it names, and the section holds the reviewers' keys (URLs can hold passwords too), so
+    each of the three repair models first passes its input through hidden(): every string, byte string and number
+    in it, in mappings, lists, tuples and sets at any depth, prints as <hidden> (no log line holds a key, spec 2.2;
+    the agent's settings errors hold no value either, 9.2). Other values (booleans, nulls, dates and timestamps)
+    and mapping keys, which are names and which the error's location shows anyway, print as they are. Validation
+    turns each hidden value back into a plain str, int or float.
+
+    That covers only errors raised inside the section. An error about the whole file (a missing top-level key, or
+    one of DispatchConfig's own checks: unique worker names, max_project_workers, the execution mode) prints the
+    file's input cut to its first and last two dozen characters or so. With repair: last in dispatch.yaml, the end
+    of its last value, which can be a reviewer's REVIEW_API_KEY, is among them, as a worker's key is today when
+    workers: comes last. So place repair: before workers:, which keeps every reviewer value away from both ends.
+
+    These helpers sit in the model because dispatcher/config.py changes only by the repair field and its three
+    models (spec 8.3).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    token_file: str
+    transcript_root: str = Field(default="~/.local/share/cairn/repair/transcripts", validate_default=True)
+    projects: list[Annotated[str, Field(min_length=1, max_length=128)]] | None = None
+    reviewers: list[RepairReviewerConfig] = Field(min_length=1)
+
+    class _HiddenStr(str):
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            return "<hidden>"
+
+    class _HiddenBytes(bytes):
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            return "<hidden>"
+
+    class _HiddenInt(int):
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            return "<hidden>"
+
+    class _HiddenFloat(float):
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            return "<hidden>"
+
+    class _HiddenDeep:
+        # What hidden() puts in place of a container nested deeper than any valid section; it holds nothing.
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            return "<hidden>"
+
+    @staticmethod
+    def hidden(data: Any) -> Any:
+        """data with each str, bytes, int and float in it printed as <hidden>, in its containers at any depth.
+
+        Containers are copied by id(), each mapping and list once per call: a YAML alias stays one shared object,
+        so a value used through many aliases costs no more than its anchor, and an alias that holds itself stays a
+        cycle, which pydantic then reports under its key, as it does elsewhere in dispatch.yaml.
+
+        A container 32 levels down or deeper, which no valid section has, is not copied: it prints as one <hidden>.
+        A chain of aliases, each anchor holding the one before it, builds an object as deep as the chain is long
+        from as many short lines, and the YAML loader builds it without recursing. hidden() recurses once per
+        level, so without that limit such a chain would end in a RecursionError, where the same chain in today's
+        sections is an error that names the key.
+        """
+        return RepairConfig._hidden(data, {}, 0)
+
+    @staticmethod
+    def _hidden(data: Any, copies: dict[int, tuple[Any, Any]], depth: int) -> Any:
+        # copies maps id() of each container met so far to (that container, its copy). Holding the container keeps
+        # it alive for the whole call, so that no other object can be given its id() meanwhile. depth is how many
+        # containers hold data in this call: 0 for the input itself.
+        if isinstance(data, bool):  # a bool is an int; it is no secret, and a strict bool field needs a real one
+            return data
+        if isinstance(data, str):
+            return RepairConfig._HiddenStr(data)
+        if isinstance(data, bytes):  # YAML's !!binary
+            return RepairConfig._HiddenBytes(data)
+        if isinstance(data, int):
+            return RepairConfig._HiddenInt(data)
+        if isinstance(data, float):
+            return RepairConfig._HiddenFloat(data)
+        if not isinstance(data, (dict, list, tuple, set, frozenset)):
+            return data
+        known = copies.get(id(data))
+        if known is not None:  # looked up before the depth limit, so that a value copied once stays one shared copy
+            return known[1]
+        if depth >= 32:
+            # A valid section is 4 levels deep at most (repair.reviewers.N.env.KEY), and pydantic reports an error at
+            # the first level that fails, so it never looks this far down.
+            return RepairConfig._HiddenDeep()
+        if isinstance(data, dict):
+            mapping: dict[Any, Any] = {}
+            copies[id(data)] = (data, mapping)  # before its values, so that a value holding this mapping gets the copy
+            for key, value in data.items():
+                mapping[key] = RepairConfig._hidden(value, copies, depth + 1)
+            return mapping
+        if isinstance(data, list):
+            items: list[Any] = []
+            copies[id(data)] = (data, items)
+            for item in data:
+                items.append(RepairConfig._hidden(item, copies, depth + 1))
+            return items
+        # YAML's !!pairs and !!omap give tuples, and !!set a set. Neither can hold itself, so a cycle through one
+        # also passes a mapping or a list, whose copy is in copies by then: the recursion ends there. A set's copy
+        # can iterate in another order, as a set of strings does from one process to the next anyway.
+        hidden_items = [RepairConfig._hidden(item, copies, depth + 1) for item in data]
+        if isinstance(data, tuple):
+            copied: Any = tuple(hidden_items)
+        elif isinstance(data, set):
+            copied = set(hidden_items)
+        else:
+            copied = frozenset(hidden_items)
+        copies[id(data)] = (data, copied)
+        return copied
+
+    @staticmethod
+    def refuse_placeholder(value: str) -> str:
+        if "<" in value or ">" in value:
+            raise ValueError("still contains < or >, an unedited placeholder")
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def hide_inputs(cls, data: Any) -> Any:
+        return cls.hidden(data)
+
+    @field_validator("token_file", "transcript_root")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        expanded = os.path.expanduser(cls.refuse_placeholder(value))
+        if not os.path.isabs(expanded):
+            raise ValueError("must be an absolute path once ~ is expanded")
+        return expanded
+
+    @field_validator("projects")
+    @classmethod
+    def validate_projects(cls, value: list[str] | None) -> list[str] | None:
+        for project_id in value or ():
+            cls.refuse_placeholder(project_id)
+        return value
+
+    @field_validator("reviewers")
+    @classmethod
+    def validate_reviewer_names(cls, value: list[RepairReviewerConfig]) -> list[RepairReviewerConfig]:
+        names = [reviewer.name for reviewer in value]
+        if len(set(names)) != len(names):
+            raise ValueError("reviewer names must be unique")
+        return value
+
+
 class DispatchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -214,6 +466,7 @@ class DispatchConfig(BaseModel):
     local: LocalConfig | None = None
     common_env: dict[str, str] = Field(default_factory=dict)
     workers: list[WorkerConfig]
+    repair: RepairConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
