@@ -14,6 +14,10 @@ wrong token, the other role's included, gets 401 `unauthorized`. Each protected 
 dependency, and the repair routes run that same check before anything else, before FastAPI reads the body, which it
 does before it resolves dependencies: so a body that is not JSON gets the 401 or 503 too, and is never read.
 
+Only ASCII whitespace is removed around a token (ASCII_WHITESPACE), as the dispatcher and the agent remove it around
+theirs: they apply the same rule to their token files (spec 7), so a token file that one of them refuses as not_ascii
+is refused here too, and roles_configured never shows a dispatcher token that the dispatcher itself refuses.
+
 Token values are never logged. A failed authentication is logged with the role and the route's fixed endpoint name,
 never the request path, which can hold anything a caller sends before it is authenticated, at most once per role in
 any 60 seconds.
@@ -41,6 +45,10 @@ TOKEN_ENV = {"agent": "CAIRN_REPAIR_AGENT_TOKEN", "dispatcher": "CAIRN_REPAIR_DI
 # A token file is a few dozen bytes. A larger file, or anything but a regular file (a FIFO, a device), is refused as
 # unreadable, so that reading it can never hold up or exhaust the server at its start.
 MAX_TOKEN_FILE_BYTES = 65536
+# The whitespace removed around a token: what bytes.strip() removes, as the dispatcher and the agent remove it around
+# theirs. str.strip() would also remove 0x1C-0x1F, U+0085, U+00A0 and the other Unicode spaces, none of them printable
+# ASCII; they stay, and the printable-ASCII rule refuses them here as there.
+ASCII_WHITESPACE = " \t\n\r\x0b\x0c"
 AUTH_FAILURE_LOG_INTERVAL_SECONDS = 60.0
 # The fixed names of the protected routes, as a failed authentication logs them.
 ENDPOINTS = frozenset({"runs.list", "runs.get", "runs.review", "runs.register", "runs.end"})
@@ -73,7 +81,7 @@ _STATE = _TokenState()
 
 
 def _read_token_file(path: str) -> str | _Unreadable:
-    """The file's text with surrounding whitespace removed, or _UNREADABLE."""
+    """The file's text with the ASCII whitespace around it removed (ASCII_WHITESPACE), or _UNREADABLE."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     except (OSError, ValueError):
@@ -93,7 +101,7 @@ def _read_token_file(path: str) -> str | _Unreadable:
     if len(data) > MAX_TOKEN_FILE_BYTES:
         return _UNREADABLE
     # Bytes that are not UTF-8 are kept as surrogates, which the printable-ASCII rule then refuses.
-    return data.decode("utf-8", errors="surrogateescape").strip()
+    return data.decode("utf-8", errors="surrogateescape").strip(ASCII_WHITESPACE)
 
 
 def _problem(token: str) -> str | None:
@@ -148,7 +156,7 @@ def load_tokens(environ: Mapping[str, str] | None = None) -> None:
         if path:
             values[role] = _read_token_file(path)
         elif value:
-            values[role] = value.strip()
+            values[role] = value.strip(ASCII_WHITESPACE)
         else:
             values[role] = None
     _install(values)
