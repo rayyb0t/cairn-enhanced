@@ -1,0 +1,18 @@
+# The repair agent's own configuration in Compose: write it to ./repair.compose.yaml at the repository root,
+# where docker-compose.repair.yaml mounts it read-only at /repair-agent/repair.yaml.
+# It holds no server address, project list, model or key: the agent reads those from the dispatcher's settings
+# file, <transcripts.root>/agent-settings.json, which the dispatcher writes from the repair: section of
+# dispatch.yaml at its start.
+
+token_file: "/run/secrets/repair-agent.token"        # mounted read-only by the override
+server_api_key_file: null                            # dev-0.3.0 port only: sent as X-API-Key
+server_ca_bundle: null                               # optional CA file for an https server URL; no proxy is ever used
+dispatch_config_to_check: null                       # null is accepted only inside a container, which mounts no dispatch.yaml
+poll_interval: 5                                     # seconds, 2-30
+max_concurrent_reviews: 4                            # 1-16
+transcripts:
+  root: "/var/lib/cairn-repair/transcripts"          # the dispatcher's transcript_root, mounted read-only; holds the settings file
+  max_bytes: 67108864                                # 64 MiB, the dispatcher's cap
+  max_staleness_seconds: 45                          # how much older than the window's opening the copy's last check may be
+digest:
+  max_tokens_estimate: 8000                          # the digest budget; a reviewer's context_window can lower it

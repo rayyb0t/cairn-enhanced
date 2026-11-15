@@ -1,0 +1,7 @@
+.venv/
+tests/
+**/*.yaml
+!repair.example.yaml
+!repair.compose.example.yaml
+**/*.key
+**/*.token

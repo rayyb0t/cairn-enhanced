@@ -1,0 +1,76 @@
+[project]
+name = "cairn-repair-agent"
+version = "0.1.0"
+description = "Cairn repair agent: reviews long explore runs in shadow mode and records one decision per review window"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.34.2",
+    "pyyaml>=6.0",
+    "pydantic>=2.7",
+]
+
+[project.scripts]
+cairn-repair = "cairn_repair_agent.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.9,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "cairn",
+    "httpx>=0.27",
+    "pytest>=8.3",
+]
+
+[tool.uv]
+# The tests that run the server's or the dispatcher's code here (the dev group's cairn) run it on the versions that
+# cairn/uv.lock installs in production: every package both locks hold is pinned to cairn's version, except requests and
+# urllib3, at the versions Appendix C-1's read rules were checked with (spec §9.1), and certifi, whose CA bundle the
+# agent's own TLS connections use. tests/test_entry_point.py checks that uv.lock still agrees with cairn/uv.lock.
+constraint-dependencies = [
+    "annotated-doc==0.0.4",
+    "annotated-types==0.7.0",
+    "anyio==4.13.0",
+    "charset-normalizer==3.4.7",
+    "click==8.3.2",
+    "colorama==0.4.6",
+    "docker==7.1.0",
+    "fastapi==0.135.3",
+    "h11==0.16.0",
+    "httpcore==1.0.9",
+    "httptools==0.7.1",
+    "httpx==0.28.1",
+    "idna==3.11",
+    "iniconfig==2.3.0",
+    "packaging==26.2",
+    "pluggy==1.6.0",
+    "pydantic-core==2.41.5",
+    "pydantic==2.12.5",
+    "pygments==2.20.0",
+    "pytest==9.0.3",
+    "python-dotenv==1.2.2",
+    "pywin32==311",
+    "pyyaml==6.0.3",
+    "requests==2.34.2",
+    "starlette==1.0.0",
+    "typing-extensions==4.15.0",
+    "typing-inspection==0.4.2",
+    "urllib3==2.8.0",
+    "uvicorn==0.44.0",
+    "uvloop==0.22.1",
+    "watchfiles==1.1.1",
+    "websockets==16.0",
+]
+
+[tool.uv.sources]
+# Editable, so those tests run ../cairn/src as it is now. A copy would be taken at the first sync and kept: uv checks
+# only cairn's pyproject.toml and the top of its src/ before reinstalling it. `uv sync --no-dev` never reads this line.
+cairn = { path = "../cairn", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
