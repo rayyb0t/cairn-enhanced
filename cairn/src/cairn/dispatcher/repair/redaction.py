@@ -4,8 +4,9 @@ Every byte a copy takes from a worker's session file passes through redact_exact
 values that secret_values collects: the secret values of every configured worker's env (common_env included), in
 local mode those of the dispatcher's own environment and of the local CLIs' credential files, the dispatcher's
 repair token, and each reviewer's REVIEW_API_KEY, plus the user:pass and the password of every URL among those
-environments' values. The values are kept in memory only and are never logged: a copy's meta.json counts the
-matches per name, and a log line gives at most a credential file's label.
+environments' and those files' values, of dispatch.yaml's server, and of each reviewer's REVIEW_BASE_URL and proxy.
+The values are kept in memory only and are never logged: a copy's meta.json counts the matches per name, and a log
+line gives at most a credential file's label.
 
 The repair agent's pattern-based redaction is the second layer, for keys this set does not know (spec 9.6).
 
@@ -38,12 +39,20 @@ CREDENTIAL_ONLY_MIN_CHARS = 16  # every string of a credential-only file of at l
 CREDENTIAL_FILE_MAX_BYTES = 16 * 1024 * 1024
 
 REPAIR_TOKEN_NAME = "repair_token"  # noqa: S105 - the name redactions are counted under, not a secret
+# The name that the URL passwords of dispatch.yaml's server are counted under: that setting's own name.
+SERVER_NAME = "server"
 REVIEW_API_KEY_NAME = "REVIEW_API_KEY"
+# The names that a reviewer's URL passwords are counted under, as its key is under REVIEW_API_KEY: those of its
+# REVIEW_BASE_URL under that variable's name, and those of its proxy setting, which has no variable name, under
+# REVIEW_PROXY.
+REVIEW_BASE_URL_NAME = "REVIEW_BASE_URL"
+REVIEW_PROXY_NAME = "REVIEW_PROXY"
 
 # The local CLIs' credential files (spec 8.8), by label. Credential-only files give every string value of at least
 # CREDENTIAL_ONLY_MIN_CHARS at any depth (pi keeps OAuth tokens under access and refresh, names no rule matches);
 # the others give the string values of at least SECRET_MIN_CHARS whose own key matches the secret-name rule or is
-# key or apiKey.
+# key or apiKey (of settings.json, only its env object is read). Each also gives the user:pass and the password of
+# every URL with a password among the string values read, whatever their keys (url_userinfo_values).
 CLAUDE_CREDENTIALS = "claude:.credentials.json"
 CLAUDE_JSON = "claude:.claude.json"
 CLAUDE_SETTINGS = "claude:settings.json"
@@ -114,8 +123,12 @@ def secret_values(
     In this order, a value first met keeping its first name: every configured worker's env (common_env is already
     merged into it), in dispatch.yaml order; in local mode the dispatcher's own environment (environ), which local
     workers inherit, and the local CLIs' credential files, found through each worker's merged environment
-    {**environ, **worker.env}; the repair token; and each reviewer's REVIEW_API_KEY of at least SECRET_MIN_CHARS.
-    The credential files are read on each call, so a caller that calls again sees rotated tokens.
+    {**environ, **worker.env}; the repair token; the user:pass and the password of dispatch.yaml's server when it is
+    a URL with a password (url_userinfo_values), under server; and for each reviewer, its REVIEW_API_KEY of at least
+    SECRET_MIN_CHARS and the user:pass and the password of its REVIEW_BASE_URL and of its proxy when either is a URL
+    with a password, under REVIEW_BASE_URL and REVIEW_PROXY. A local worker can read the server and the reviewers'
+    values in dispatch.yaml and in the agent's settings file, as it can a reviewer's key (spec 2.2, 8.8). The
+    credential files are read on each call, so a caller that calls again sees rotated tokens.
     """
     found: dict[str, str] = {}
 
@@ -131,11 +144,17 @@ def secret_values(
         add(credential_file_pairs(config, environ))
     if repair_token:
         add([(REPAIR_TOKEN_NAME, repair_token)])
+    # A Cairn server behind a proxy with basic auth puts a password in this URL, which requests sends from it.
+    add((SERVER_NAME, part) for part in url_userinfo_values(config.server))
     if config.repair is not None:
         for reviewer in config.repair.reviewers:
             key = reviewer.env.REVIEW_API_KEY
             if key is not None and len(key) >= SECRET_MIN_CHARS:
                 add([(REVIEW_API_KEY_NAME, key)])
+            # A model server behind basic auth, or a corporate proxy, puts a password in these URLs.
+            add((REVIEW_BASE_URL_NAME, part) for part in url_userinfo_values(reviewer.env.REVIEW_BASE_URL))
+            if reviewer.proxy is not None:
+                add((REVIEW_PROXY_NAME, part) for part in url_userinfo_values(reviewer.proxy))
     return found
 
 
@@ -273,12 +292,20 @@ def _credential_values(label: str, path: str) -> list[str]:
         return []
     if not isinstance(parsed, dict):
         return []
-    if label in CREDENTIAL_ONLY_LABELS:
-        return _strings(parsed, CREDENTIAL_ONLY_MIN_CHARS, keyed=False)
     if label == CLAUDE_SETTINGS:
-        env = parsed.get("env")
-        return _strings(env, SECRET_MIN_CHARS, keyed=True) if isinstance(env, dict) else []
-    return _strings(parsed, SECRET_MIN_CHARS, keyed=True)
+        parsed = parsed.get("env")  # of settings.json, only its env object is read
+        if not isinstance(parsed, dict):
+            return []
+    if label in CREDENTIAL_ONLY_LABELS:
+        values = _strings(parsed, CREDENTIAL_ONLY_MIN_CHARS, keyed=False)
+    else:
+        values = _strings(parsed, SECRET_MIN_CHARS, keyed=True)
+    # A URL with a password among the values read, whatever its key (an HTTPS_PROXY in settings.json env or in
+    # config.toml's shell_environment_policy.set, which the CLI and every command the worker runs then see, or a
+    # provider's or an MCP server's URL), also gives its user:pass and its password, as such a URL in an environment
+    # does (environment_pairs).
+    values.extend(part for value in _strings(parsed, 0, keyed=False) for part in url_userinfo_values(value))
+    return values
 
 
 def _read_credential_file(label: str, path: str) -> bytes | None:

@@ -241,10 +241,16 @@ class RepairReviewerEnv(BaseModel):
         # validator, and the result stays hidden. pydantic prints an after-validator's error with the input that
         # reached it, so a before-validator written after validate_api_key would hand that check a stripped key to
         # print in place of <hidden>.
-        if isinstance(value, bytes):  # YAML's !!binary, which the str field decodes
-            value = RepairConfig.hidden(value.strip())
-        elif isinstance(value, str):
-            value = RepairConfig.hidden(value.strip(" \t\n\r\x0b\x0c"))
+        # A hidden key is stripped once and its stripped copy kept on it, as validated_once keeps what it validates
+        # to: every place that a YAML anchor of the key fills gets that one copy, also when the str field refuses it
+        # (a !!binary key that is not UTF-8, a key with a lone surrogate) and the error of each place holds it.
+        if isinstance(value, (str, bytes)):
+            kept = value.__dict__ if isinstance(value, (RepairConfig._HiddenStr, RepairConfig._HiddenBytes)) else {}
+            if "stripped" not in kept:
+                # YAML's !!binary, which the str field decodes, loses what bytes.strip() removes: the same characters.
+                stripped = value.strip() if isinstance(value, bytes) else value.strip(" \t\n\r\x0b\x0c")
+                kept["stripped"] = RepairConfig.hidden(stripped)
+            value = kept["stripped"]
         return None if isinstance(value, (str, bytes)) and not value else value
 
     @field_validator("REVIEW_API_KEY")
@@ -256,6 +262,12 @@ class RepairReviewerEnv(BaseModel):
         if not (value.isascii() and value.isprintable()):
             raise ValueError("REVIEW_API_KEY must be printable ASCII (0x20-0x7E)")
         return value
+
+    @field_validator("*", mode="wrap")
+    @classmethod
+    def validate_once(cls, value: Any, handler: Any, info: Any) -> Any:
+        # Written last, so it wraps each field's other validators: they get the hidden input as it is, and print it.
+        return RepairConfig.validated_once(value, handler, (cls, info.field_name))
 
 
 class RepairReviewerConfig(BaseModel):
@@ -307,6 +319,12 @@ class RepairReviewerConfig(BaseModel):
             raise ValueError("price must have exactly the keys input_per_mtok and output_per_mtok")
         return value
 
+    @field_validator("*", mode="wrap")
+    @classmethod
+    def validate_once(cls, value: Any, handler: Any, info: Any) -> Any:
+        # Written last, so it wraps each field's other validators: they get the hidden input as it is, and print it.
+        return RepairConfig.validated_once(value, handler, (cls, info.field_name))
+
 
 class RepairConfig(BaseModel):
     """The optional repair: section of dispatch.yaml (spec 8.3; owner decision O1).
@@ -320,7 +338,8 @@ class RepairConfig(BaseModel):
     in it, in mappings, lists, tuples and sets at any depth, prints as <hidden> (no log line holds a key, spec 2.2;
     the agent's settings errors hold no value either, 9.2). Other values (booleans, nulls, dates and timestamps)
     and mapping keys, which are names and which the error's location shows anyway, print as they are. Validation
-    turns each hidden value back into a plain str, int or float.
+    turns each hidden value back into a plain str, int or float; in the two nested models it does so once per field
+    (validated_once), so that a YAML anchor that fills many of their places is converted once, not once per place.
 
     That covers only errors raised inside the section. An error about the whole file (a missing top-level key, or
     one of DispatchConfig's own checks: unique worker names, max_project_workers, the execution mode) prints the
@@ -339,29 +358,34 @@ class RepairConfig(BaseModel):
     projects: list[Annotated[str, Field(min_length=1, max_length=128)]] | None = None
     reviewers: list[RepairReviewerConfig] = Field(min_length=1)
 
+    # The hidden scalars have no __slots__: each keeps, in its __dict__, the plain values that validation made of it
+    # (validated_once), and a REVIEW_API_KEY its stripped copy (empty_api_key_is_unset). A bytes or int subclass can
+    # have no named slot, so none of the four has one.
     class _HiddenStr(str):
-        __slots__ = ()
-
         def __repr__(self) -> str:
             return "<hidden>"
 
     class _HiddenBytes(bytes):
-        __slots__ = ()
-
         def __repr__(self) -> str:
             return "<hidden>"
 
     class _HiddenInt(int):
-        __slots__ = ()
-
         def __repr__(self) -> str:
             return "<hidden>"
 
     class _HiddenFloat(float):
-        __slots__ = ()
-
         def __repr__(self) -> str:
             return "<hidden>"
+
+    # What hidden() copies a mapping and a list into, so that hidden() knows them when it meets them again. Their repr
+    # and comparisons are a dict's and a list's; pydantic validates them as one, and gives back a plain dict or list.
+    # An error's input_type names their class, RepairConfig._HiddenDict or RepairConfig._HiddenList, as it names
+    # RepairConfig._HiddenStr for a hidden string, where it would name dict or list for an unhidden input.
+    class _HiddenDict(dict):
+        __slots__ = ()
+
+    class _HiddenList(list):
+        __slots__ = ()
 
     class _HiddenDeep:
         # What hidden() puts in place of a container nested deeper than any valid section; it holds nothing.
@@ -374,9 +398,13 @@ class RepairConfig(BaseModel):
     def hidden(data: Any) -> Any:
         """data with each str, bytes, int and float in it printed as <hidden>, in its containers at any depth.
 
-        Containers are copied by id(), each mapping and list once per call: a YAML alias stays one shared object,
-        so a value used through many aliases costs no more than its anchor, and an alias that holds itself stays a
-        cycle, which pydantic then reports under its key, as it does elsewhere in dispatch.yaml.
+        Each value, a string, a number or a container, is copied once per call, however many times it is met: a
+        YAML alias stays one shared object, and an alias that holds itself stays a cycle, which pydantic then
+        reports under its key, as it does elsewhere in dispatch.yaml. What hidden() made is given back as it is, so
+        the nested models' validators, which run on the section's copy, copy nothing again. With validated_once(),
+        a value used through many aliases costs about what its anchor does while the section loads, as in today's
+        sections; pydantic still builds a model, a list or a mapping for each place, as it does there, and a
+        project id of projects, at most 128 characters, is converted in each place.
 
         A container 32 levels down or deeper, which no valid section has, is not copied: it prints as one <hidden>.
         A chain of aliases, each anchor holding the one before it, builds an object as deep as the chain is long
@@ -387,44 +415,68 @@ class RepairConfig(BaseModel):
         return RepairConfig._hidden(data, {}, 0)
 
     @staticmethod
+    def _kept(data: Any) -> bool:
+        """Whether hidden() gives data back as it is: a value it made, in which every value is hidden already, or
+        one with nothing to hide (a bool, which is an int but no secret and which a strict bool field needs as it
+        is, a null, a date, a model)."""
+        if isinstance(
+            data,
+            (
+                bool,
+                RepairConfig._HiddenStr,
+                RepairConfig._HiddenBytes,
+                RepairConfig._HiddenInt,
+                RepairConfig._HiddenFloat,
+                RepairConfig._HiddenDict,
+                RepairConfig._HiddenList,
+            ),
+        ):
+            return True
+        return not isinstance(data, (str, bytes, int, float, dict, list, tuple, set, frozenset))
+
+    @staticmethod
     def _hidden(data: Any, copies: dict[int, tuple[Any, Any]], depth: int) -> Any:
-        # copies maps id() of each container met so far to (that container, its copy). Holding the container keeps
-        # it alive for the whole call, so that no other object can be given its id() meanwhile. depth is how many
-        # containers hold data in this call: 0 for the input itself.
-        if isinstance(data, bool):  # a bool is an int; it is no secret, and a strict bool field needs a real one
-            return data
-        if isinstance(data, str):
-            return RepairConfig._HiddenStr(data)
-        if isinstance(data, bytes):  # YAML's !!binary
-            return RepairConfig._HiddenBytes(data)
-        if isinstance(data, int):
-            return RepairConfig._HiddenInt(data)
-        if isinstance(data, float):
-            return RepairConfig._HiddenFloat(data)
-        if not isinstance(data, (dict, list, tuple, set, frozenset)):
+        # copies maps id() of each value met so far to (that value, its copy). Holding the value keeps it alive for
+        # the whole call, so that no other object can be given its id() meanwhile. depth is how many containers hold
+        # data in this call: 0 for the input itself.
+        if RepairConfig._kept(data):
             return data
         known = copies.get(id(data))
         if known is not None:  # looked up before the depth limit, so that a value copied once stays one shared copy
             return known[1]
+        if isinstance(data, (str, bytes, int, float)):
+            if isinstance(data, str):
+                scalar: Any = RepairConfig._HiddenStr(data)
+            elif isinstance(data, bytes):  # YAML's !!binary
+                scalar = RepairConfig._HiddenBytes(data)
+            elif isinstance(data, int):
+                scalar = RepairConfig._HiddenInt(data)
+            else:
+                scalar = RepairConfig._HiddenFloat(data)
+            copies[id(data)] = (data, scalar)
+            return scalar
         if depth >= 32:
             # A valid section is 4 levels deep at most (repair.reviewers.N.env.KEY), and pydantic reports an error at
             # the first level that fails, so it never looks this far down.
             return RepairConfig._HiddenDeep()
         if isinstance(data, dict):
-            mapping: dict[Any, Any] = {}
+            mapping = RepairConfig._HiddenDict()
             copies[id(data)] = (data, mapping)  # before its values, so that a value holding this mapping gets the copy
             for key, value in data.items():
                 mapping[key] = RepairConfig._hidden(value, copies, depth + 1)
             return mapping
         if isinstance(data, list):
-            items: list[Any] = []
+            items = RepairConfig._HiddenList()
             copies[id(data)] = (data, items)
             for item in data:
                 items.append(RepairConfig._hidden(item, copies, depth + 1))
             return items
         # YAML's !!pairs and !!omap give tuples, and !!set a set. Neither can hold itself, so a cycle through one
         # also passes a mapping or a list, whose copy is in copies by then: the recursion ends there. A set's copy
-        # can iterate in another order, as a set of strings does from one process to the next anyway.
+        # can iterate in another order, as a set of strings does from one process to the next anyway. One that holds
+        # nothing to hide, such as one that hidden() made, which a nested model's validator meets, is not copied.
+        if all(RepairConfig._kept(item) for item in data):
+            return data
         hidden_items = [RepairConfig._hidden(item, copies, depth + 1) for item in data]
         if isinstance(data, tuple):
             copied: Any = tuple(hidden_items)
@@ -440,6 +492,53 @@ class RepairConfig(BaseModel):
         if "<" in value or ">" in value:
             raise ValueError("still contains < or >, an unedited placeholder")
         return value
+
+    @staticmethod
+    def validated_once(value: Any, handler: Any, field: Any) -> Any:
+        """What handler, a field's validation, makes of value; for a hidden scalar, made once per field.
+
+        pydantic gives back a new str, int or float for each str, bytes, int or float subclass it validates, so each
+        place that a hidden value fills would otherwise hold a copy of it: a 256 KiB anchor used through 400 aliases
+        would be 100 MiB. The nested models' validators read nothing but the value, so validating one hidden value
+        for one field always gives the same result: the first is kept on the hidden value, under field, and every
+        later place gets that same object.
+
+        A value that fails is validated again in each place, so that each place gets its own error, printed with the
+        hidden input: the value itself, or, where the str field refuses a REVIEW_API_KEY, the one stripped copy that
+        empty_api_key_is_unset keeps on it. The error itself is never kept: it holds the hidden value in a way the
+        garbage collector does not see, so keeping it on that value would leak both. Every validation here, of a
+        hidden scalar or of anything else, goes through _validated(), so that no failure holds what pydantic made of
+        its value either.
+        """
+        if not isinstance(
+            value,
+            (RepairConfig._HiddenStr, RepairConfig._HiddenBytes, RepairConfig._HiddenInt, RepairConfig._HiddenFloat),
+        ):
+            return RepairConfig._validated(value, handler)
+        made: dict[Any, Any] = value.__dict__.setdefault("validated", {})
+        if field not in made:
+            made[field] = RepairConfig._validated(value, handler)
+        return made[field]
+
+    @staticmethod
+    def _validated(value: Any, handler: Any) -> Any:
+        """handler(value); if it fails, its error is raised without the tracebacks of the exceptions it holds.
+
+        pydantic keeps in the error the exception that one of the models' validators raised, and that exception's
+        traceback would keep the validator's frame, which holds what pydantic made of the value for this place: a
+        plain copy of a hidden string, or a plain dict of a price that validate_price refuses. A value that fills
+        many places would then be held once per place, by each place's error. The tracebacks are dropped, whatever
+        the value, so a failing value is held once, by its hidden copy.
+        """
+        try:
+            return handler(value)
+        except ValueError as error:  # pydantic's ValidationError is a ValueError, with errors()
+            # No local refers to the error: this frame goes with it, in its traceback, and would make a cycle.
+            for detail in getattr(error, "errors", lambda **_: ())(include_url=False):
+                raised = (detail.get("ctx") or {}).get("error")
+                if isinstance(raised, BaseException):
+                    raised.__traceback__ = None
+            raise
 
     @model_validator(mode="before")
     @classmethod
