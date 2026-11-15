@@ -235,7 +235,17 @@ class RepairReviewerEnv(BaseModel):
     @field_validator("REVIEW_API_KEY", mode="before")
     @classmethod
     def empty_api_key_is_unset(cls, value: Any) -> Any:
-        return None if value == "" else value
+        # The whitespace around the key is removed first, only the ASCII whitespace that bytes.strip() removes, as
+        # from the token (spec 8.3), so that the settings file, the shared-key check and the removal from copies hold
+        # the key as it is sent; empty is then the same as left out. It is removed here, in the field's first
+        # validator, and the result stays hidden. pydantic prints an after-validator's error with the input that
+        # reached it, so a before-validator written after validate_api_key would hand that check a stripped key to
+        # print in place of <hidden>.
+        if isinstance(value, bytes):  # YAML's !!binary, which the str field decodes
+            value = RepairConfig.hidden(value.strip())
+        elif isinstance(value, str):
+            value = RepairConfig.hidden(value.strip(" \t\n\r\x0b\x0c"))
+        return None if isinstance(value, (str, bytes)) and not value else value
 
     @field_validator("REVIEW_API_KEY")
     @classmethod
@@ -252,13 +262,17 @@ class RepairReviewerConfig(BaseModel):
     """One entry of repair.reviewers (spec 8.3): written like a worker entry, but never a worker.
 
     The optional settings are Appendix C-1's. Only their types are checked here; left out or null, the
-    repair agent applies C-1's default, and it checks the values at its start.
+    repair agent applies C-1's default, and it checks the values at its start. api_format (owner decision O8) is
+    checked for its two values only; left out or null it stays None here, and the agent's settings file holds
+    openai_chat for it. The agent's own rules for anthropic_messages (a key, no structured_output: true) stop the
+    agent, never the dispatcher.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     env: RepairReviewerEnv
+    api_format: Literal["openai_chat", "anthropic_messages"] | None = None
     structured_output: bool | None = Field(default=None, strict=True)
     max_tokens: int | None = Field(default=None, ge=1, strict=True)
     context_window: int | None = Field(default=None, ge=1, strict=True)

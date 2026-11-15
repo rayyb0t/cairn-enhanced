@@ -35,13 +35,21 @@ from typing import Any
 from cairn.dispatcher.config import DispatchConfig, LocalConfig
 from cairn.dispatcher.repair import redaction, transcripts
 from cairn.dispatcher.repair.client import RepairRunsClient
-from cairn.dispatcher.repair.config import RepairState, load_state
+from cairn.dispatcher.repair.config import ASCII_WHITESPACE, RepairState, load_state
 from cairn.dispatcher.repair.session_ids import valid_project_id
 
 LOG = logging.getLogger(__name__)
 
 THREAD_NAME = "repair-housekeeping"
 HOUSEKEEPING_INTERVAL_SECONDS = 60
+
+# The whitespace removed around a key: what bytes.strip() removes, as from the dispatcher token (repair/config.py)
+# and from REVIEW_API_KEY when dispatch.yaml is loaded (dispatcher/config.py), spec 8.3.
+KEY_WHITESPACE = ASCII_WHITESPACE.decode("ascii")
+
+# A reviewer's call when its api_format is left out or null (spec 8.3; owner decision O8). The settings file always
+# names the format, so that the agent never guesses it.
+DEFAULT_API_FORMAT = "openai_chat"
 
 # A reviewer's optional client settings (Appendix C-1), written to the agent's settings file when set.
 OPTIONAL_REVIEWER_SETTINGS = (
@@ -92,7 +100,9 @@ def check_shared_keys(config: DispatchConfig) -> None:
 
     Each key that is set is compared, by exact value, with the worker values the copy redaction collects
     (repair/redaction.py): for each worker entry the secret values of its env, common_env included, and the user:pass
-    and password of every URL in it; in local mode also those of the dispatcher's own environment. The local CLIs'
+    and password of every URL in it; in local mode also those of the dispatcher's own environment. Each of those
+    values is compared as written and with the whitespace around it removed, as it is removed around the key when
+    dispatch.yaml is loaded, so that a key written with the same spaces in both places still matches. The local CLIs'
     credential files are not read for this (owner decision O4), and the repair token is not a worker's. The line
     names the reviewer and the matching workers in dispatch.yaml order, then environment; never a value. Sharing is
     allowed: nothing else happens.
@@ -100,8 +110,14 @@ def check_shared_keys(config: DispatchConfig) -> None:
     repair = config.repair
     if repair is None:
         return
-    workers = [(worker.name, redaction.environment_values(worker.env)) for worker in config.workers]
-    environment = redaction.environment_values(os.environ) if config.runtime.execution == "local" else set()
+    workers = [
+        (worker.name, _as_written_and_stripped(redaction.environment_values(worker.env))) for worker in config.workers
+    ]
+    environment = (
+        _as_written_and_stripped(redaction.environment_values(os.environ))
+        if config.runtime.execution == "local"
+        else set()
+    )
     for reviewer in repair.reviewers:
         key = reviewer.env.REVIEW_API_KEY
         if not key:
@@ -113,12 +129,17 @@ def check_shared_keys(config: DispatchConfig) -> None:
             LOG.warning("repair reviewer shares a worker key reviewer=%s worker=%s", reviewer.name, ",".join(holders))
 
 
+def _as_written_and_stripped(values: set[str]) -> set[str]:
+    """values, and each of them with the whitespace around it removed (KEY_WHITESPACE)."""
+    return values | {value.strip(KEY_WHITESPACE) for value in values}
+
+
 def agent_settings(config: DispatchConfig) -> dict[str, Any]:
     """The content of the agent's settings file (spec 8.3): version (first), server, projects and the reviewers.
 
-    Each reviewer has name, model, base_url and api_key (null when left out), plus each optional setting that is
-    set and not null, under its own name. Nothing else from dispatch.yaml: no worker entry or env, no common_env, no
-    token or token_file, no transcript_root.
+    Each reviewer has name, model, base_url, api_key (null when left out) and api_format (openai_chat when left out
+    or null, owner decision O8), plus each optional setting that is set and not null, under its own name. Nothing
+    else from dispatch.yaml: no worker entry or env, no common_env, no token or token_file, no transcript_root.
     """
     repair = config.repair
     if repair is None:
@@ -130,6 +151,7 @@ def agent_settings(config: DispatchConfig) -> dict[str, Any]:
             "model": reviewer.env.REVIEW_MODEL,
             "base_url": reviewer.env.REVIEW_BASE_URL,
             "api_key": reviewer.env.REVIEW_API_KEY,
+            "api_format": reviewer.api_format or DEFAULT_API_FORMAT,
         }
         for name in OPTIONAL_REVIEWER_SETTINGS:
             value = getattr(reviewer, name)

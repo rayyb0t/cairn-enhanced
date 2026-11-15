@@ -154,9 +154,10 @@ def settings_path(config: DispatchConfig) -> Path:
 def _ds28_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     """DS28. With spec 8.3's example, a worker env, a common_env and a token file each holding a distinctive canary,
     agent-settings.json parses to exactly version (first), server, projects and reviewers; each reviewer has name,
-    model, base_url and api_key (null when left out) plus only the optional settings that are set and not null; no
-    canary, nor the token_file path, is in its bytes. The file is 0640 with the root's group (as root, a root of
-    another group). Without repair: nothing is written and no root is created.
+    model, base_url, api_key (null when left out) and api_format (openai_chat when left out, DS32) plus only the
+    optional settings that are set and not null; no canary, nor the token_file path, is in its bytes. The file is
+    0640 with the root's group (as root, a root of another group). Without repair: nothing is written and no root is
+    created.
     """
     section = repair_section()
     section["reviewers"].append(
@@ -198,12 +199,19 @@ def _ds28_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytes
         "server": "http://127.0.0.1:8000",
         "projects": None,
         "reviewers": [
-            {"name": "reviewer_local", "model": "test-model", "base_url": "http://127.0.0.1:11434/v1", "api_key": None},
+            {
+                "name": "reviewer_local",
+                "model": "test-model",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "api_key": None,
+                "api_format": "openai_chat",
+            },
             {
                 "name": "reviewer_provider",
                 "model": "test-model",
                 "base_url": "https://provider.invalid/v1",
                 "api_key": FAKE_REVIEWER_KEY,
+                "api_format": "openai_chat",
                 "timeout_seconds": 180,
             },
             {
@@ -211,6 +219,7 @@ def _ds28_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytes
                 "model": "test-model",
                 "base_url": "https://full.invalid/v1",
                 "api_key": None,
+                "api_format": "openai_chat",
                 "structured_output": False,
                 "max_tokens": 4096,
                 "context_window": 32768,
