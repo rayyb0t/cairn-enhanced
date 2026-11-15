@@ -78,6 +78,15 @@ class ProjectMeta(BaseModel):
     bootstrap_enabled: bool
     created_at: str
     reason: ProjectReason | None = None
+    # Additive: the project's Repair switch (shadow mode). The default lets a newer dispatcher read an older server.
+    repair_enabled: bool = False
+
+    @field_validator("repair_enabled", mode="before")
+    @classmethod
+    def read_only_true_as_on(cls, value: Any) -> bool:
+        # The dispatcher parses these models too: only a JSON true turns the switch on, and no value of this
+        # field (null, 1, "yes", or a value from a newer or other server) can fail a project read.
+        return value is True
 
 
 class ProjectSummary(ProjectMeta):
@@ -113,6 +122,8 @@ class CreateProjectRequest(BaseModel):
     origin: str
     goal: str
     bootstrap_enabled: bool = True
+    # A plain bool, as bootstrap_enabled: a value it cannot read is refused with a 422.
+    repair_enabled: bool = False
     hints: list[CreateHintInline] | None = None
 
     @field_validator("title", "origin", "goal")

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from cairn.server.db import get_conn
 from cairn.server.models import (
@@ -27,12 +27,14 @@ from cairn.server.services import (
     get_completion_intent_or_409,
     get_project_or_404,
     intent_to_model,
+    log_repair_switch,
     next_fact_id,
     next_hint_id,
     next_intent_id,
     next_project_id,
     project_meta_from_row,
     project_reason_from_row,
+    project_repair_enabled,
     utcnow,
     validate_facts_exist,
     validate_goal_not_in_sources,
@@ -64,6 +66,7 @@ def list_projects():
                 bootstrap_enabled=bool(row["bootstrap_enabled"]),
                 created_at=row["created_at"],
                 reason=project_reason_from_row(row),
+                repair_enabled=project_repair_enabled(row),
                 fact_count=row["fact_count"],
                 intent_count=row["intent_count"],
                 working_intent_count=row["working_intent_count"],
@@ -75,7 +78,7 @@ def list_projects():
 
 
 @router.post("/projects", response_model=ProjectDetail, status_code=201)
-def create_project(body: CreateProjectRequest):
+def create_project(body: CreateProjectRequest, request: Request):
     with get_conn() as conn:
         pid = next_project_id(conn)
         now = utcnow()
@@ -84,6 +87,8 @@ def create_project(body: CreateProjectRequest):
             "INSERT INTO projects (id, title, status, bootstrap_enabled, created_at) VALUES (?, ?, 'active', ?, ?)",
             (pid, body.title, body.bootstrap_enabled, now),
         )
+        if body.repair_enabled:
+            conn.execute("UPDATE projects SET repair_enabled = 1 WHERE id = ?", (pid,))
         conn.execute(
             "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
             ("origin", pid, body.origin),
@@ -103,7 +108,7 @@ def create_project(body: CreateProjectRequest):
                 )
                 hints.append(Hint(id=hid, content=h.content, creator=h.creator, created_at=now))
 
-        return ProjectDetail(
+        detail = ProjectDetail(
             project=ProjectMeta(
                 id=pid,
                 title=body.title,
@@ -111,6 +116,7 @@ def create_project(body: CreateProjectRequest):
                 bootstrap_enabled=body.bootstrap_enabled,
                 created_at=now,
                 reason=None,
+                repair_enabled=body.repair_enabled,
             ),
             facts=[
                 Fact(id="origin", description=body.origin),
@@ -119,6 +125,10 @@ def create_project(body: CreateProjectRequest):
             intents=[],
             hints=hints,
         )
+    # Logged once the project is committed: the line says that the switch is on.
+    if body.repair_enabled:
+        log_repair_switch(pid, True, request)
+    return detail
 
 
 @router.get("/projects/{project_id}", response_model=ProjectDetail)

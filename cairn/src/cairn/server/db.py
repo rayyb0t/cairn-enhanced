@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS projects (
     reason_worker TEXT,
     reason_trigger TEXT,
     reason_started_at TEXT,
-    reason_last_heartbeat_at TEXT
+    reason_last_heartbeat_at TEXT,
+    repair_enabled INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS facts (
@@ -93,6 +94,55 @@ CREATE TABLE IF NOT EXISTS intent_issues (
 );
 
 CREATE INDEX IF NOT EXISTS intent_issues_by_intent ON intent_issues (project_id, intent_id);
+
+-- Repair layer (shadow mode). A run is deleted with its intent, and a review with its run, inside the
+-- deleting statement: today's project delete and reopen cascade into these tables, and nothing else does.
+CREATE TABLE IF NOT EXISTS repair_runs (
+    run_id TEXT PRIMARY KEY,                    -- dispatcher-generated (uuid4 hex), one per execute process
+    project_id TEXT NOT NULL,
+    intent_id TEXT NOT NULL,
+    worker TEXT NOT NULL,                       -- worker name, the server's claim key
+    cli_type TEXT NOT NULL,                     -- claudecode | codex | pi | mock
+    execution TEXT NOT NULL,                    -- container | local
+    session_id TEXT,                            -- NULL until known
+    locator_json TEXT NOT NULL DEFAULT '{}',    -- opaque: container or workdir, prompt marker, dispatcher start time
+    budget_seconds INTEGER NOT NULL,            -- tasks.explore.timeout at run start
+    started_at TEXT NOT NULL,                   -- server clock: receive time minus started_seconds_ago
+    deadline_at TEXT NOT NULL,                  -- started_at + budget_seconds; never moves in Phase 2
+    version INTEGER NOT NULL DEFAULT 1,         -- always 1 in Phase 2
+    slices_used INTEGER NOT NULL DEFAULT 0,     -- always 0 in Phase 2
+    state TEXT NOT NULL DEFAULT 'running',      -- running | ended (Phase 3/4 add sealed, detached, stop_requested)
+    reviewable INTEGER NOT NULL DEFAULT 1,      -- 0 if the window is under 350 s or the CLI has no transcript
+    settled_window INTEGER NOT NULL DEFAULT 0,  -- highest window whose review question is settled
+    registered_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    ended_at TEXT,                              -- when the server marked the run ended
+    end_reason TEXT,                            -- dispatcher | superseded | concluded | released | claim_lost | claim_taken | project_inactive
+    last_alive_at TEXT,                         -- last moment the run is known to have been alive; NULL if unknown
+    outcome TEXT,                               -- return value of run_explore_task, from the second /end
+    outcome_json TEXT,                          -- {"timed_out", "cancelled", "returncode"} from the first /end
+    fact_id TEXT,                               -- the fact the intent produced, once known
+    FOREIGN KEY (intent_id, project_id) REFERENCES intents(id, project_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS repair_runs_open_key ON repair_runs (project_id, intent_id, worker) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS repair_runs_by_intent ON repair_runs (project_id, intent_id);
+CREATE INDEX IF NOT EXISTS repair_runs_attention ON repair_runs (project_id) WHERE ended_at IS NULL OR settled_window = 0;
+
+CREATE TABLE IF NOT EXISTS repair_reviews (
+    run_id TEXT NOT NULL REFERENCES repair_runs(run_id) ON DELETE CASCADE,
+    window_no INTEGER NOT NULL,                 -- "window" is an SQL keyword
+    review_id TEXT NOT NULL,                    -- the agent's idempotency key; 'server' for not_reviewed
+    source TEXT NOT NULL,                       -- agent | server
+    decision TEXT NOT NULL,                     -- continue | extend | detach | not_reviewed
+    issue_id INTEGER,                           -- the intent_issues row shown in the UI
+    detail_json TEXT NOT NULL,                  -- the full stored review
+    digest TEXT,                                -- what the model saw, at most 65536 characters
+    digest_sha256 TEXT,
+    raw_output TEXT,                            -- the model's first text block, at most 16384 characters
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, window_no)
+);
 """
 
 
@@ -115,6 +165,9 @@ def _ensure_project_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE projects SET bootstrap_enabled = CASE WHEN bootstrap_mode = 'disabled' THEN 0 ELSE 1 END"
             )
+    if "repair_enabled" not in columns:
+        # Every existing project starts with its Repair switch off.
+        conn.execute("ALTER TABLE projects ADD COLUMN repair_enabled INTEGER NOT NULL DEFAULT 0")
 
 
 @contextmanager

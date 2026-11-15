@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from pydantic import ValidationError
 
 from cairn.server.db import get_conn
 from cairn.server.models import Intent, IntentIssue, ProjectMeta, ProjectReason
 
 LOG = logging.getLogger(__name__)
+# The repair layer's server lines (the switch line included) all go through this logger.
+REPAIR_LOG = logging.getLogger("cairn.server.repair")
+_SWITCH_CLIENT_RE = re.compile(r"[0-9A-Fa-f:.]{2,45}")
 
 JSON_REPAIRED = "json_repaired"
 # The strategies of the dispatcher's JSON rescue (cairn.dispatcher.output_parser.rescue_text_envelope).
@@ -336,6 +341,38 @@ def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
         bootstrap_enabled=bool(row["bootstrap_enabled"]),
         created_at=row["created_at"],
         reason=project_reason_from_row(row),
+        repair_enabled=project_repair_enabled(row),
+    )
+
+
+def project_repair_enabled(row: sqlite3.Row) -> bool:
+    """The project's Repair switch. A row without the column reads off, so it never fails a project read."""
+    if "repair_enabled" not in row.keys():  # noqa: SIM118 (on a sqlite3.Row, `in row` tests the values)
+        return False
+    return bool(row["repair_enabled"])
+
+
+def repair_switch_client(request: Request) -> str:
+    """The caller's address for the switch log line, or "-" when it is not a plain IP address.
+
+    Both checks are needed: ip_address() also accepts an IPv6 scope id (the text after "%"), which can hold any
+    printable text. The address only says that a change happened, not who made it: a caller on 127.0.0.1 can
+    set it with X-Forwarded-For.
+    """
+    host = request.client.host if request.client is not None else None
+    if not isinstance(host, str) or _SWITCH_CLIENT_RE.fullmatch(host) is None:
+        return "-"
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return "-"
+    return host
+
+
+def log_repair_switch(project_id: str, enabled: bool, request: Request) -> None:
+    """The one log line of a switch change, at WARNING so that it shows with no logging configuration."""
+    REPAIR_LOG.warning(
+        "repair switch project=%s enabled=%s client=%s", project_id, enabled, repair_switch_client(request)
     )
 
 
