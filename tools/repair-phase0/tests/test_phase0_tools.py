@@ -349,6 +349,27 @@ def test_top_and_kill_attempts() -> None:
     assert kill_check.kill_pid_accepted([{"command": ["kill"], "exit_code": 127}]) is None
 
 
+def test_conclusions_of_a_missed_kill_with_the_fixed_kill_do_not_blame_the_old_mechanism() -> None:
+    # The fixed kill() never uses the host PID that exec_inspect reports; when it leaves a run going (for example on
+    # an image whose timeout replaces itself with the command), the dispatcher's own warning says why.
+    results = {
+        "managed_kill": {
+            "exec_running_after_kill": True,
+            "kill_attempts": [],
+            "kill_pid_accepted_attempt": None,
+            "exec_inspect_pid": 5096,
+            "exec_pid_host_command": "timeout -k 2s 120s sh -c ...",
+            "exec_pid_visible_inside_container": False,
+            "kill_replay_with_output": None,
+            "survivors": ["wrapper"],
+        },
+    }
+    text = " ".join(kill_check.conclusions(results))
+    assert "did not stop the run" in text
+    assert "host PID" not in text and "no process has that PID" not in text
+    assert "the dispatcher's warning gives the reason" in text
+
+
 def test_conclusions_describe_a_missed_kill() -> None:
     results = {
         "managed_kill": {
