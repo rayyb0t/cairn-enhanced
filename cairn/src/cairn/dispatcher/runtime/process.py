@@ -20,15 +20,28 @@ EXEC_KILL_POLL_SECONDS = 0.05
 # kill() runs KILL_GROUP_SCRIPT as one short helper exec in the run's container. The image's timeout
 # bounds it there: every image that can run the run's own `timeout -k 5s Ns` wrapper has one.
 EXEC_KILL_HELPER = ("timeout", "-k", "1s", "3s", "/bin/sh", "-c")
+# The helper's only change to the container's environment. bash as /bin/sh writes a warning to
+# stderr when LC_ALL names a locale the image lacks, and that line would end the read before the
+# helper's status line.
+EXEC_KILL_HELPER_ENV = {"LC_ALL": "C"}
 EXEC_KILL_HELPER_NAME = "cairn-kill"
 EXEC_KILL_STATUS_PREFIX = "cairn-kill: "
-# The helper lives at most 3 s + 1 s; its output is never waited for longer than this.
+# The helper lives at most 3 s + 1 s. Its output is read for at most this long; the read is then
+# cancelled (docker-py cannot cancel a stream over ssh://, where it lasts until Docker ends it).
 EXEC_KILL_HELPER_READ_SECONDS = 5.0
-# A helper attempt that took this long and did not kill (for example a /proc scan of a container
-# with tens of thousands of processes) makes this process's later kills wait before trying again,
-# so cancel(), which the scheduler repeats every tick, cannot hold the scheduler loop each time.
-EXEC_KILL_SLOW_HELPER_SECONDS = 2.0
-EXEC_KILL_SLOW_HELPER_PAUSE_SECONDS = 30.0
+# A kill attempt whose Docker calls after the run's process was found (the twin check and the
+# helper) took this long and did not kill makes cancel() skip this process's kill attempts for the
+# pause that follows. The scheduler repeats cancel() every tick on its own thread, and a slow
+# container must not hold the scheduler loop each time. kill() is called once, on a thread of its
+# own (communicate()'s timeout, the heartbeat's lease loss), and nothing repeats it: the pause never
+# skips it, and it waits up to EXEC_KILL_WAIT_FOR_ATTEMPT_SECONDS for another thread's attempt in
+# progress, then makes its own if that one did not kill. If that attempt is still running then,
+# kill() returns without an attempt of its own.
+EXEC_KILL_SLOW_ATTEMPT_SECONDS = 2.0
+EXEC_KILL_SLOW_ATTEMPT_PAUSE_SECONDS = 30.0
+# Longer than every attempt measured on Docker: 3-7 s with exits held at default settings, 11.2 s at
+# a 10 us thread switch interval. Only kill()'s own thread waits.
+EXEC_KILL_WAIT_FOR_ATTEMPT_SECONDS = 15.0
 
 # Runs as `/bin/sh -c KILL_GROUP_SCRIPT cairn-kill <sha256>` (a second argument, a /proc root, is
 # only for tests), as the image's default user, which is also the run's user.
@@ -109,14 +122,15 @@ class ManagedProcess:
         self._done = threading.Event()
         # kill() state. _state_lock orders a kill against the reader thread's exec_start and is
         # never held across a Docker call. _kill_lock lets one thread at a time make a kill
-        # attempt and guards the three fields after it.
+        # attempt and guards the fields after it; cancel() also reads _cancel_paused_until
+        # without it, so that a paused cancel() never takes it.
         self._state_lock = threading.Lock()
         self._kill_requested = False
         self._exec_started = False
         self._kill_lock = threading.Lock()
         self._killed = False
         self._start_wait_spent = False
-        self._helper_paused_until = 0.0
+        self._cancel_paused_until = 0.0
         self._kill_warned: set[str] = set()
 
     def start(self) -> None:
@@ -161,9 +175,20 @@ class ManagedProcess:
 
         Docker has no call that stops one exec, and exec_inspect's Pid is a host PID, so this runs
         KILL_GROUP_SCRIPT in one short helper exec. Safe to call repeatedly and from several
-        threads: a call made while another thread is killing returns at once, and calls after a
-        successful kill make no Docker call.
+        threads; one thread at a time makes an attempt. A kill() that arrives during another
+        thread's attempt waits for it, at most EXEC_KILL_WAIT_FOR_ATTEMPT_SECONDS, then makes its
+        own if that one did not kill (cancel() returns at once instead). Calls after a successful
+        kill make no Docker call.
         """
+        self._kill(respect_pause=False)
+
+    def cancel(self, reason: str) -> None:
+        if self._cancel_reason is None:
+            self._cancel_reason = reason
+        # The scheduler repeats cancel() every tick: only cancel() skips attempts after a slow one.
+        self._kill(respect_pause=True)
+
+    def _kill(self, respect_pause: bool) -> None:
         if self._exec_id is None:
             return
         with self._state_lock:
@@ -171,18 +196,28 @@ class ManagedProcess:
             exec_started = self._exec_started
         if not exec_started or self._killed:
             return  # not started yet: the reader thread sees the request and never starts it
-        if not self._kill_lock.acquire(blocking=False):
+        if respect_pause and self._cancel_paused():
+            return
+        # cancel() runs on the scheduler's loop and never waits for another thread's attempt. kill() runs on a
+        # thread of its own and is not repeated, so it waits for one in progress (bounded) and then makes its own;
+        # if that attempt outlasts the bound, kill() returns without one.
+        if respect_pause:
+            acquired = self._kill_lock.acquire(blocking=False)
+        else:
+            acquired = self._kill_lock.acquire(timeout=EXEC_KILL_WAIT_FOR_ATTEMPT_SECONDS)
+        if not acquired:
             return
         try:
             if not self._killed:
-                self._kill_started_exec()
+                self._kill_started_exec(respect_pause)
         finally:
             self._kill_lock.release()
 
-    def cancel(self, reason: str) -> None:
-        if self._cancel_reason is None:
-            self._cancel_reason = reason
-        self.kill()
+    def _cancel_paused(self) -> bool:
+        if time.monotonic() < self._cancel_paused_until:
+            LOG.debug("cancel skips the kill attempt after a slow one exec_id=%s container=%s", self._exec_id, self._container.name)
+            return True
+        return False
 
     def _read_stream(self) -> None:
         assert self._exec_id is not None
@@ -247,20 +282,39 @@ class ManagedProcess:
                 return 137 if self._timed_out else 1
             time.sleep(0.1)
 
-    def _kill_started_exec(self) -> None:
-        if time.monotonic() < self._helper_paused_until:
-            LOG.debug("kill helper paused after a slow attempt exec_id=%s container=%s", self._exec_id, self._container.name)
+    def _kill_started_exec(self, respect_pause: bool) -> None:
+        name = self._container.name
+        if respect_pause and self._cancel_paused():  # again: an attempt that just ended may have set it
             return
         details = self._wait_for_exec_process()
         if details is None:
             return
-        name = self._container.name
         argv = _exec_argv(details) or list(self.command)
         try:
             digest = _cmdline_sha256(argv)
         except UnicodeError as exc:
             self._warn_once("argv", "cannot identify container exec to kill exec_id=%s container=%s error=%s", self._exec_id, name, exc)
             return
+        began = time.monotonic()
+        killed = False
+        try:
+            killed = self._kill_group(argv, digest)
+        finally:
+            spent = time.monotonic() - began
+            if not killed and spent >= EXEC_KILL_SLOW_ATTEMPT_SECONDS:
+                self._cancel_paused_until = time.monotonic() + EXEC_KILL_SLOW_ATTEMPT_PAUSE_SECONDS
+                self._warn_once(
+                    "slow",
+                    "kill attempt took %.1fs and did not kill, cancel() skips kill attempts for %.0fs exec_id=%s container=%s",
+                    spent,
+                    EXEC_KILL_SLOW_ATTEMPT_PAUSE_SECONDS,
+                    self._exec_id,
+                    name,
+                )
+
+    def _kill_group(self, argv: list[str], digest: str) -> bool:
+        """The twin check, then the helper; True when the helper killed the run's process group."""
+        name = self._container.name
         try:
             twins = self._running_twins(argv)
             if twins:
@@ -271,37 +325,33 @@ class ManagedProcess:
                     name,
                     ",".join(twins),
                 )
-                return
-            began = time.monotonic()
-            try:
-                stdout, stderr = self._run_kill_helper(digest)
-            finally:
-                spent = time.monotonic() - began
-                if spent >= EXEC_KILL_SLOW_HELPER_SECONDS:
-                    self._helper_paused_until = time.monotonic() + EXEC_KILL_SLOW_HELPER_PAUSE_SECONDS
-                    self._warn_once(
-                        "slow",
-                        "kill helper took %.1fs, next kill attempts wait %.0fs exec_id=%s container=%s",
-                        spent,
-                        EXEC_KILL_SLOW_HELPER_PAUSE_SECONDS,
-                        self._exec_id,
-                        name,
-                    )
+                return False
+            stdout, stderr = self._run_kill_helper(digest)
         except DockerException as exc:
             self._warn_once("docker", "failed to kill container exec exec_id=%s container=%s error=%s", self._exec_id, name, exc)
-            return
+            return False
+        except RuntimeError as exc:  # the read bound's thread could not start (a pids or thread limit)
+            self._warn_once(
+                "thread",
+                "kill helper started but its result could not be read, it may still kill the run exec_id=%s container=%s error=%s",
+                self._exec_id,
+                name,
+                exc,
+            )
+            return False
         status = next(
             (line[len(EXEC_KILL_STATUS_PREFIX) :] for line in stdout.splitlines() if line.startswith(EXEC_KILL_STATUS_PREFIX)), None
         )
         if status is None:
             output = " ".join(f"{stdout} {stderr}".split())[:300]
             self._warn_once("output", "kill helper gave no result exec_id=%s container=%s output=%s", self._exec_id, name, output)
-            return
+            return False
         verdict, _, detail = status.strip().partition(" ")
         if verdict == "killed":
             self._killed = True
             LOG.info("killed container exec process group exec_id=%s container=%s pgid=%s", self._exec_id, name, detail)
-        elif verdict == "none":
+            return True
+        if verdict == "none":
             self._warn_once(
                 "none",
                 "no process of the container exec found to kill (it may have just ended, or the image's timeout replaces itself with the command, as BusyBox's does) exec_id=%s container=%s",
@@ -312,6 +362,7 @@ class ManagedProcess:
             self._warn_once(
                 verdict, "not killing container exec: helper reported %s exec_id=%s container=%s", status.strip(), self._exec_id, name
             )
+        return False
 
     def _wait_for_exec_process(self) -> dict[str, Any] | None:
         """exec_inspect once the exec's process exists; None when it has ended or has no process.
@@ -364,36 +415,46 @@ class ManagedProcess:
         return twins
 
     def _run_kill_helper(self, digest: str) -> tuple[str, str]:
-        """Run KILL_GROUP_SCRIPT and return its stdout and stderr, read up to its status line.
+        """Run KILL_GROUP_SCRIPT and return its stdout and stderr, read up to the first line of either.
 
-        The stream is then closed rather than read to its end: when the run just killed leaves a
-        process that still holds its output (a setsid child), Docker ends this helper's stream
-        only about 2 s later, which would hold kill() for that long.
+        The script prints one status line on stdout and nothing on stderr, so a line on stderr means
+        the helper itself failed. The read also ends after EXEC_KILL_HELPER_READ_SECONDS, except over
+        ssh://, where docker-py cannot cancel a stream and the read lasts until Docker ends it. The stream
+        is closed rather than read to its end: Docker ends a helper's stream only after it has
+        handled every earlier exit in the container, and each of those may wait 2 s for output (for
+        example a setsid child of the run just killed that still holds it).
         """
         command = [*EXEC_KILL_HELPER, KILL_GROUP_SCRIPT, EXEC_KILL_HELPER_NAME, digest]
-        helper_id = self._api.exec_create(self._container.id, command, stdout=True, stderr=True, stdin=False, tty=False)["Id"]
+        helper_id = self._api.exec_create(
+            self._container.id, command, stdout=True, stderr=True, stdin=False, tty=False, environment=dict(EXEC_KILL_HELPER_ENV)
+        )["Id"]
         stream = self._api.exec_start(helper_id, detach=False, tty=False, stream=True, demux=True)
         stdout: list[str] = []
         stderr: list[str] = []
-        # Docker ends this stream only after it has handled every earlier exit in the container, each
-        # of which may wait 2 s for output; so the read must not depend on the stream ending.
         expired = threading.Event()
 
         def expire() -> None:
+            # Only wake the read: docker-py's stream.close() shuts the socket down, and the blocked
+            # read then ends as at the end of the stream. The response, and with it the pooled
+            # connection, is released by the reading thread alone, in its finally: released by two
+            # threads at once, one connection could be handed to two requests.
             expired.set()
-            self._close_stream(stream)
+            close = getattr(stream, "close", None)
+            if callable(close):
+                with suppress(Exception):
+                    close()
 
         deadline = threading.Timer(EXEC_KILL_HELPER_READ_SECONDS, expire)
         deadline.daemon = True
-        deadline.start()
         try:
+            deadline.start()
             for chunk in stream:
                 out, err = self._split_chunk(chunk)
                 stdout.append(out)
                 stderr.append(err)
                 if "\n" in out or "\n" in err:
                     break
-        except (OSError, ValueError):  # the stream closed under the read when the deadline passed
+        except (OSError, ValueError):  # a read that failed, rather than ended, when the deadline closed it
             if not expired.is_set():
                 raise
         finally:

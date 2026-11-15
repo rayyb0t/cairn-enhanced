@@ -101,8 +101,8 @@ def wait_for(container: Any, needles: list[str], timeout: float = 10) -> list[Pr
         time.sleep(0.1)
 
 
-def start(manager: ContainerManager, name: str, argv: list[str], timeout_s: int = 120) -> ManagedProcess:
-    process = manager.build_exec_process(name, {}, argv, timeout_seconds=timeout_s)
+def start(manager: ContainerManager, name: str, argv: list[str], timeout_s: int = 120, env: dict[str, str] | None = None) -> ManagedProcess:
+    process = manager.build_exec_process(name, env or {}, argv, timeout_seconds=timeout_s)
     process.start()
     return process
 
@@ -117,7 +117,11 @@ def helper_execs(container: Any, since: float) -> list[str]:
     until = int(time.time()) + 1
     time.sleep(max(0.0, until - time.time()))
     events = container.client.events(since=int(since), until=until, filters={"container": container.id}, decode=True)
-    return [str(e.get("Action", "")) for e in events if str(e.get("Action", "")).startswith("exec_create") and "cairn-kill" in str(e.get("Action", ""))]
+    return [
+        str(e.get("Action", ""))
+        for e in events
+        if str(e.get("Action", "")).startswith("exec_create") and "cairn-kill" in str(e.get("Action", ""))
+    ]
 
 
 def test_kill_stops_this_run_and_nothing_else(env: tuple[ContainerManager, str, Any]) -> None:
@@ -230,7 +234,9 @@ def test_communicate_timeout_ends_the_run(env: tuple[ContainerManager, str, Any]
 def test_normal_run_is_unchanged_and_a_late_kill_runs_no_helper(env: tuple[ContainerManager, str, Any]) -> None:
     manager, name, container = env
     since = time.time()
-    process = start(manager, name, ["sh", "-c", "echo out; echo err >&2; exit 3"], timeout_s=60)
+    # LC_ALL=C: where /bin/sh is bash and the image's LC_ALL names a missing locale, the run's own sh
+    # would warn on its stderr, which has nothing to do with kill().
+    process = start(manager, name, ["sh", "-c", "echo out; echo err >&2; exit 3"], timeout_s=60, env={"LC_ALL": "C"})
     result = process.communicate(timeout=30)
 
     process.kill()

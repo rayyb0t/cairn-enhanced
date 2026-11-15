@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 import requests
-from docker.errors import APIError, NotFound
+from docker.errors import APIError, DockerException, NotFound
 
 from cairn.dispatcher.runtime import process as process_module
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
@@ -71,24 +71,69 @@ class HelperStream:
         self.closed = True
 
 
-class SilentHelperStream:
-    """A helper stream that never sends anything: Docker holding it open. Closing it makes the blocked
-    read fail, as docker-py's stream does once its socket is shut down."""
+class RecordingResponse:
+    """A stream's HTTP response: closing it releases the connection back to docker-py's pool."""
 
     def __init__(self) -> None:
+        self.closed_by: list[str] = []
+
+    def close(self) -> None:
+        self.closed_by.append(threading.current_thread().name)
+
+
+class SilentHelperStream:
+    """A helper stream that never sends anything: Docker holding it open. close() shuts its socket
+    down, which ends the blocked read as at the end of the stream, as docker-py's does; with
+    fail_on_close, the read fails instead."""
+
+    def __init__(self, fail_on_close: bool = False) -> None:
         self.closed = False
+        self.closed_by: list[str] = []
+        self._fail_on_close = fail_on_close
         self._closed = threading.Event()
+        self._response = RecordingResponse()
 
     def __iter__(self) -> Iterator[tuple[bytes | None, bytes | None]]:
         return self
 
     def __next__(self) -> tuple[bytes | None, bytes | None]:
         self._closed.wait(10)
-        raise ValueError("I/O operation on closed file")
+        if self._fail_on_close:
+            raise ValueError("I/O operation on closed file")
+        raise StopIteration
 
     def close(self) -> None:
         self.closed = True
+        self.closed_by.append(threading.current_thread().name)
         self._closed.set()
+
+
+class UncancellableHelperStream(SilentHelperStream):
+    """docker-py over ssh://: close() cannot shut the stream down, so only Docker ends it (end())."""
+
+    def close(self) -> None:
+        self.closed_by.append(threading.current_thread().name)
+        raise DockerException("Cancellable streams not supported for the SSH protocol")
+
+    def end(self) -> None:
+        self._closed.set()
+
+
+class FailingHelperStream:
+    """A helper stream whose read fails at once, long before the read bound."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.closed = False
+
+    def __iter__(self) -> FailingHelperStream:
+        return self
+
+    def __next__(self) -> tuple[bytes | None, bytes | None]:
+        raise self.error
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeAPI:
@@ -255,7 +300,8 @@ def test_kill_runs_one_helper_that_targets_this_runs_command_line() -> None:
     assert api.helpers == [
         (
             ["timeout", "-k", "1s", "3s", "/bin/sh", "-c", KILL_GROUP_SCRIPT, "cairn-kill", SHA],
-            {"stdout": True, "stderr": True, "stdin": False, "tty": False},  # the image's user, nothing more
+            # the image's user; only a fixed locale is added to the container's environment
+            {"stdout": True, "stderr": True, "stdin": False, "tty": False, "environment": {"LC_ALL": "C"}},
         )
     ]
     assert ("exec_start", ("helper-1",), {"detach": False, "tty": False, "stream": True, "demux": True}) in api.calls
@@ -572,8 +618,8 @@ def test_a_kill_that_gets_the_lock_after_another_one_succeeded_does_nothing() ->
         def __init__(self) -> None:
             self.lock = threading.Lock()
 
-        def acquire(self, blocking: bool = True) -> bool:
-            acquired = self.lock.acquire(blocking)
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            acquired = self.lock.acquire(blocking, timeout)
             process._killed = True
             return acquired
 
@@ -589,6 +635,104 @@ def test_a_kill_that_gets_the_lock_after_another_one_succeeded_does_nothing() ->
     assert api.calls[calls:] == []
     assert not late.lock.locked()
     api.stream.end()
+
+
+def started_attempt_in(thread: threading.Thread, api: FakeAPI) -> None:
+    """Start `thread`, whose kill attempt then waits in its helper's exec_start (api.helper_gate) until released."""
+    thread.start()
+    deadline = time.monotonic() + 5
+    while "helper-1" not in str(api.calls) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "helper-1" in str(api.calls)
+
+
+def test_a_one_shot_kill_waits_for_an_attempt_in_progress_and_then_makes_its_own() -> None:
+    # The scheduler's cancel() is in its attempt when the lease is lost: dropping that kill(), as e45ad72 did,
+    # leaves the run to cancel()'s next attempt, 30 s later when this one was slow (and to nothing at all when the
+    # attempt in progress is the other one-shot kill()). It waits, and as that attempt did not kill, makes its own.
+    process, api = make_process()
+    started(process, api)
+    api.helper_gate = threading.Event()
+    outcomes: list[list[tuple[bytes | None, bytes | None]]] = [[(b"cairn-kill: none\n", None)], [(b"cairn-kill: killed 23\n", None)]]
+
+    def next_helper() -> HelperStream:
+        chunks = outcomes.pop(0)
+        if chunks[0][0] and chunks[0][0].startswith(b"cairn-kill: killed"):
+            api.stream.end()
+        return HelperStream(chunks, False)
+
+    api.helper_stream_factory = next_helper
+    scheduler = threading.Thread(target=process.cancel, args=("deleted",))
+    started_attempt_in(scheduler, api)
+    lease = threading.Thread(target=process.kill)
+    lease.start()
+    time.sleep(0.2)
+    assert lease.is_alive()  # waiting for the attempt in progress, not dropped
+
+    api.helper_gate.set()
+    scheduler.join(5)
+    lease.join(5)
+    assert len(api.helpers) == 2 and process._killed
+    assert process.communicate(timeout=5).returncode == 137
+
+
+def test_a_one_shot_kill_that_waited_for_an_attempt_that_killed_does_nothing_more() -> None:
+    process, api = make_process()
+    started(process, api)
+    api.helper_gate = threading.Event()
+    scheduler = threading.Thread(target=process.cancel, args=("deleted",))
+    started_attempt_in(scheduler, api)
+    lease = threading.Thread(target=process.kill)
+    lease.start()
+    time.sleep(0.2)
+
+    api.helper_gate.set()
+    scheduler.join(5)
+    lease.join(5)
+    assert process._killed and len(api.helpers) == 1
+
+
+def test_a_one_shot_kill_waits_for_another_attempt_only_up_to_its_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(process_module, "EXEC_KILL_WAIT_FOR_ATTEMPT_SECONDS", 0.3)
+    process, api = make_process()
+    started(process, api)
+    process._kill_lock.acquire()  # an attempt in progress on another thread that does not end in time
+    try:
+        began = time.monotonic()
+        process.kill()
+        assert 0.25 <= time.monotonic() - began < 2
+    finally:
+        process._kill_lock.release()
+    assert api.helpers == []
+    api.stream.end()
+
+
+def test_a_paused_cancel_never_takes_the_kill_lock() -> None:
+    # A lease-loss kill() landing while a paused tick held the lock would otherwise wait on it for nothing.
+    process, api = make_process()
+    started(process, api)
+    process._cancel_paused_until = time.monotonic() + 30
+    taken: list[str] = []
+
+    class RecordingLock:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            taken.append(threading.current_thread().name)
+            return self.lock.acquire(blocking, timeout)
+
+        def release(self) -> None:
+            self.lock.release()
+
+    process._kill_lock = RecordingLock()  # type: ignore[assignment]
+    calls = len(api.calls)
+
+    process.cancel("deleted")
+    assert taken == [] and api.calls[calls:] == []
+
+    process.kill()  # the pause is cancel()'s only
+    assert taken and process._killed
 
 
 def test_a_container_that_lists_no_execs_does_not_block_the_kill() -> None:
@@ -612,13 +756,16 @@ def test_communicate_timeout_kills_the_run() -> None:
     assert (result.returncode, result.timed_out, result.cancelled) == (137, True, False)
 
 
-def test_a_helper_that_never_answers_is_abandoned_at_the_read_bound(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize("fail_on_close", [False, True], ids=["read-ends", "read-fails"])
+def test_a_helper_that_never_answers_is_abandoned_at_the_read_bound(
+    fail_on_close: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     # Docker ends a helper's stream only after every earlier exit in the container, so kill() must
     # not wait for the stream to end when the helper prints nothing.
     monkeypatch.setattr(process_module, "EXEC_KILL_HELPER_READ_SECONDS", 0.3)
     process, api = make_process()
     started(process, api)
-    api.helper_stream_factory = SilentHelperStream
+    api.helper_stream_factory = lambda: SilentHelperStream(fail_on_close)
 
     began = time.monotonic()
     process.kill()
@@ -645,11 +792,11 @@ def test_a_helper_error_line_on_stderr_ends_the_read(caplog: pytest.LogCaptureFi
     api.stream.end()
 
 
-def test_a_slow_helper_pauses_later_kill_attempts(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    # cancel() is repeated every scheduler tick; a helper that took long and did not kill must not
+def test_a_slow_attempt_pauses_later_cancel_attempts(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    # cancel() is repeated every scheduler tick; an attempt that took long and did not kill must not
     # hold the scheduler loop on every tick.
     monkeypatch.setattr(process_module, "EXEC_KILL_HELPER_READ_SECONDS", 0.3)
-    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_HELPER_SECONDS", 0.2)
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_SECONDS", 0.2)
     process, api = make_process()
     started(process, api)
     api.helper_stream_factory = SilentHelperStream
@@ -657,7 +804,7 @@ def test_a_slow_helper_pauses_later_kill_attempts(monkeypatch: pytest.MonkeyPatc
 
     process.cancel("stopped")
     assert len(api.helpers) == 1
-    assert warnings_for(caplog, "next kill attempts wait 30s") == [logging.WARNING]
+    assert warnings_for(caplog, "cancel() skips kill attempts for 30s") == [logging.WARNING]
     calls = len(api.calls)
 
     began = time.monotonic()
@@ -665,7 +812,7 @@ def test_a_slow_helper_pauses_later_kill_attempts(monkeypatch: pytest.MonkeyPatc
     assert time.monotonic() - began < 0.1
     assert api.calls[calls:] == []  # paused: no Docker call at all
 
-    process._helper_paused_until = 0.0  # the pause is over
+    process._cancel_paused_until = 0.0  # the pause is over
     process.cancel("stopped")
     assert len(api.helpers) == 2
     api.stream.end()
@@ -679,7 +826,268 @@ def test_a_fast_helper_failure_does_not_pause_later_attempts() -> None:
     process.cancel("paused")
     process.cancel("stopped")
 
-    assert len(api.helpers) == 2 and process._helper_paused_until == 0.0
+    assert len(api.helpers) == 2 and process._cancel_paused_until == 0.0
+    api.stream.end()
+
+
+def test_the_pause_lasts_its_configured_time_and_then_ends(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(process_module, "EXEC_KILL_HELPER_READ_SECONDS", 0.3)
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_SECONDS", 0.2)
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_PAUSE_SECONDS", 0.8)
+    process, api = make_process()
+    started(process, api)
+    api.helper_stream_factory = SilentHelperStream
+
+    process.cancel("stopped")
+    ended = time.monotonic()
+    time.sleep(max(0.0, ended + 0.45 - time.monotonic()))
+    process.cancel("stopped")  # 0.45 s in: still paused
+    assert len(api.helpers) == 1
+    time.sleep(max(0.0, ended + 0.95 - time.monotonic()))
+    process.cancel("stopped")  # 0.95 s in: the pause is over
+    assert len(api.helpers) == 2
+    api.stream.end()
+
+
+def test_a_slow_attempt_that_fails_in_docker_also_pauses(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    # e.g. exec_start answering only after seconds, with an error: the scheduler must not pay that every tick.
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    api.helper_gate = threading.Event()
+    api.helper_start_error = APIError("500 Server Error: timeout")
+    opener = threading.Timer(0.3, api.helper_gate.set)
+    opener.start()
+
+    process.cancel("stopped")
+    calls = len(api.calls)
+    process.cancel("stopped")
+
+    assert api.calls[calls:] == []
+    assert warnings_for(caplog, "cancel() skips kill attempts") == [logging.WARNING]
+    opener.join()
+    api.stream.end()
+
+
+def test_a_slow_twin_check_that_refuses_also_pauses_cancel(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    # Docker answers an exec's inspect only after it has handled that exec's exit, which may wait 2 s.
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    api.others = {"exec-twin": {"Running": True, "ExitCode": None, "Pid": 99, "ProcessConfig": config(COMMAND)}}
+    inspect = api.exec_inspect
+
+    def slow_inspect(exec_id: str) -> dict[str, Any]:
+        if exec_id == "exec-twin":
+            time.sleep(0.3)
+        return inspect(exec_id)
+
+    monkeypatch.setattr(api, "exec_inspect", slow_inspect)
+
+    process.cancel("stopped")
+    calls = len(api.calls)
+    process.cancel("stopped")
+
+    assert api.helpers == [] and api.calls[calls:] == []
+    assert warnings_for(caplog, "cancel() skips kill attempts for 30s") == [logging.WARNING]
+    api.stream.end()
+
+
+def test_a_slow_attempt_that_killed_neither_pauses_nor_warns(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    api.helper_gate = threading.Event()
+    opener = threading.Timer(0.3, api.helper_gate.set)  # exec_start answers after 0.3 s
+    opener.start()
+
+    process.cancel("stopped")
+
+    assert process._killed and process._cancel_paused_until == 0.0
+    assert warnings_for(caplog, "cancel() skips kill attempts") == []
+    opener.join()
+
+
+@pytest.mark.parametrize("caller", ["kill", "communicate"])
+def test_one_shot_kills_still_try_while_cancel_is_paused(caller: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # HeartbeatLease._fail and communicate()'s timeout call kill() once, off the scheduler thread:
+    # nothing would retry a kill they skipped.
+    monkeypatch.setattr(process_module, "EXEC_KILL_HELPER_READ_SECONDS", 0.3)
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    api.helper_stream_factory = SilentHelperStream
+    process.cancel("deleted")  # the scheduler's cancel(): slow, no verdict, so a pause
+    assert process._cancel_paused_until > time.monotonic() + 25
+    api.helper_stream_factory = None  # the helper now answers "killed" at once
+
+    if caller == "kill":
+        process.kill()
+    else:
+        result = process.communicate(timeout=0.2)
+        assert (result.returncode, result.timed_out) == (137, True)
+
+    assert len(api.helpers) == 2 and process._killed
+
+
+def test_the_read_bound_only_wakes_the_read_and_kill_releases_the_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Over DOCKER_HOST=tcp:// all requests share one connection pool: a response released by the
+    # Timer thread and by the reading thread at once could hand one connection to two requests.
+    monkeypatch.setattr(process_module, "EXEC_KILL_HELPER_READ_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    api.helper_stream_factory = SilentHelperStream
+    me = threading.current_thread().name
+
+    process.kill()
+
+    stream = api.helper_streams[0]
+    assert stream.closed_by[0] != me  # the read bound's Timer woke the read (a socket shutdown)...
+    assert stream._response.closed_by == [me]  # ...and only kill()'s own thread released the response, once
+    api.stream.end()
+
+
+def test_a_stream_docker_py_cannot_cancel_is_read_until_docker_ends_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Over ssh:// the Timer cannot wake the read; it still never releases the response itself.
+    monkeypatch.setattr(process_module, "EXEC_KILL_HELPER_READ_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    api.helper_stream_factory = UncancellableHelperStream
+    me = threading.current_thread().name
+    ender = threading.Timer(0.6, lambda: api.helper_streams[0].end())  # Docker ending the stream
+    ender.start()
+
+    began = time.monotonic()
+    process.kill()
+
+    assert time.monotonic() - began >= 0.5
+    assert api.helper_streams[0]._response.closed_by == [me]
+    ender.join()
+    api.stream.end()
+
+
+@pytest.mark.parametrize("error", [OSError("connection reset by peer"), ValueError("bad frame")], ids=["oserror", "valueerror"])
+def test_a_read_error_before_the_read_bound_is_not_hidden(error: Exception) -> None:
+    # Only a read that the read bound itself cut short is expected to fail; any other error is raised as before.
+    process, api = make_process()
+    started(process, api)
+    api.helper_stream_factory = lambda: FailingHelperStream(error)
+
+    with pytest.raises(type(error)):
+        process.kill()
+
+    assert api.helper_streams[0].closed and not process._killed
+    api.stream.end()
+
+
+def test_the_read_bound_timer_is_stopped_when_the_status_line_arrives() -> None:
+    process, api = make_process()
+    started(process, api)
+    before = {thread for thread in threading.enumerate() if isinstance(thread, threading.Timer)}
+
+    process.kill()
+
+    assert process._killed
+    timers = [thread for thread in threading.enumerate() if isinstance(thread, threading.Timer) and thread not in before]
+    for timer in timers:
+        timer.join(0.5)
+    assert [timer for timer in timers if timer.is_alive()] == []
+
+
+def test_a_slow_kill_attempt_also_pauses_later_cancel_attempts(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    # The pause protects the scheduler loop whatever made the slow attempt: after a lease-loss kill() found the
+    # container slow, the next ticks' cancel() must not pay for it again.
+    monkeypatch.setattr(process_module, "EXEC_KILL_HELPER_READ_SECONDS", 0.3)
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    api.helper_stream_factory = SilentHelperStream
+
+    process.kill()
+    calls = len(api.calls)
+    process.cancel("deleted")
+
+    assert len(api.helpers) == 1 and api.calls[calls:] == []
+    assert warnings_for(caplog, "cancel() skips kill attempts for 30s") == [logging.WARNING]
+    api.stream.end()
+
+
+def test_waiting_for_the_runs_process_is_not_timed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only the Docker calls after the run's process was found count: a kill that first waited for Docker to
+    # create the run's process and then failed fast does not pause cancel().
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    no_pid: dict[str, Any] = {"Running": True, "ExitCode": None, "Pid": 0, "ProcessConfig": config(COMMAND)}
+    api.run_states = [no_pid] * 6  # about 0.3 s of 50 ms polls before the process exists
+    api.helper_chunks = [(b"cairn-kill: none\n", None)]
+
+    process.cancel("stopped")
+    process.cancel("stopped")
+
+    assert len(api.helpers) == 2 and process._cancel_paused_until == 0.0
+    api.stream.end()
+
+
+def test_the_read_bound_thread_never_dies_with_an_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Over ssh:// docker-py's stream.close() raises. The Timer thread must swallow that: an exception there would
+    # only be printed to stderr.
+    errors: list[BaseException | None] = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: errors.append(args.exc_value))
+    monkeypatch.setattr(process_module, "EXEC_KILL_HELPER_READ_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    api.helper_stream_factory = UncancellableHelperStream
+    ender = threading.Timer(0.5, lambda: api.helper_streams[0].end())  # Docker ending the stream
+    ender.start()
+
+    process.kill()
+    ender.join()
+    for timer in [thread for thread in threading.enumerate() if isinstance(thread, threading.Timer)]:
+        timer.join(1)
+
+    assert errors == []
+    api.stream.end()
+
+
+def test_a_slow_attempt_that_raises_also_pauses(monkeypatch: pytest.MonkeyPatch) -> None:
+    # For example docker-py's own timeout on exec_start: requests' ReadTimeout is not a DockerException, so it
+    # leaves cancel() (the scheduler loop logs it and goes on); the next ticks must not wait for it again.
+    monkeypatch.setattr(process_module, "EXEC_KILL_SLOW_ATTEMPT_SECONDS", 0.2)
+    process, api = make_process()
+    started(process, api)
+    api.helper_gate = threading.Event()
+    api.helper_start_error = requests.exceptions.ReadTimeout("read timed out")
+    opener = threading.Timer(0.3, api.helper_gate.set)  # exec_start fails after 0.3 s
+    opener.start()
+
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        process.cancel("stopped")
+    calls = len(api.calls)
+    process.cancel("stopped")
+
+    assert api.calls[calls:] == []
+    opener.join()
+    api.stream.end()
+
+
+def test_a_read_bound_that_cannot_start_its_thread_is_logged_not_raised(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # cancel() runs on the scheduler thread, whose loop survives only requests errors.
+    process, api = make_process()
+    started(process, api)
+
+    def no_thread(self: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Timer, "start", no_thread)
+
+    process.cancel("deleted")
+
+    assert api.helper_streams[0].closed and not process._killed
+    assert warnings_for(caplog, "kill helper started but its result could not be read") == [logging.WARNING]
+    assert warnings_for(caplog, "error=can't start new thread") == [logging.WARNING]
     api.stream.end()
 
 
@@ -707,6 +1115,19 @@ def test_a_status_line_split_across_frames_is_read_whole() -> None:
     process.kill()
 
     assert process._killed
+    api.stream.end()
+
+
+def test_the_twin_check_compares_the_argv_docker_recorded() -> None:
+    process, api = make_process()
+    started(process, api)
+    as_started = [*COMMAND[:-1], "prompt as Docker recorded it"]
+    api.run_state = {**api.run_state, "ProcessConfig": config(as_started)}
+    api.others = {"exec-twin": {"Running": True, "ExitCode": None, "Pid": 99, "ProcessConfig": config(as_started)}}
+
+    process.kill()
+
+    assert api.helpers == []
     api.stream.end()
 
 
@@ -863,3 +1284,136 @@ def test_script_reports_missing_tools(shell: list[str], fake_proc: Path) -> None
     no_sha256sum = "command() { return 1; }\n"  # the script's only use of command is `command -v sha256sum`
     assert run_script(shell, fake_proc, prelude=no_sha256sum)[0] == "cairn-kill: error no-sha256sum"
     assert run_script(shell, fake_proc.parent)[0] == "cairn-kill: error no-proc"
+
+
+@needs_shell
+@each_shell
+def test_script_does_not_count_a_matching_process_whose_parent_is_pid_1(shell: list[str], fake_proc: Path) -> None:
+    # An orphan reparented to the container's init is not an exec root, whatever its command line:
+    # it must not make this run's root ambiguous, nor be signalled.
+    _proc(fake_proc, 30, "timeout", 1, 30, 50003, COMMAND)
+    assert run_script(shell, fake_proc) == ("cairn-kill: killed 22", "-KILL -22")
+
+
+@needs_shell
+@each_shell
+def test_the_helpers_environment_keeps_the_shell_quiet_on_stderr(shell: list[str], fake_proc: Path) -> None:
+    # The helper's read ends at the first line on stdout or stderr. bash as /bin/sh warns on stderr
+    # at startup when LC_ALL names a locale the image lacks; Docker puts the helper's own LC_ALL
+    # over the container's, so the status line stays the first line.
+    log = fake_proc.parent / "kills.log"
+    log.write_text("")
+    done = subprocess.run(
+        [*shell, RECORD_KILLS + KILL_GROUP_SCRIPT, "cairn-kill", SHA, str(fake_proc)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**os.environ, "LC_ALL": "en_ZZ.UTF-8", "FAKE_KILL_LOG": str(log), **process_module.EXEC_KILL_HELPER_ENV},
+    )
+    assert (done.stdout, done.stderr) == ("cairn-kill: killed 22\n", "")
+
+
+# -- the lock wait and the pause check (review11) -------------------------------------------------
+
+
+def calls_by_thread(api: FakeAPI) -> list[tuple[str, str]]:
+    """Record (thread name, call) for every Docker call the fake API answers from now on."""
+    seen: list[tuple[str, str]] = []
+    for method in ("exec_create", "exec_start", "exec_inspect", "inspect_container"):
+        original = getattr(api, method)
+
+        def recording(*args: Any, _original: Any = original, _method: str = method, **kwargs: Any) -> Any:
+            seen.append((threading.current_thread().name, _method))
+            return _original(*args, **kwargs)
+
+        setattr(api, method, recording)
+    return seen
+
+
+def test_a_one_shot_kill_that_waited_for_an_attempt_that_killed_makes_no_docker_call() -> None:
+    # It waited because the lock was taken: once it has the lock, the attempt it waited for may have killed,
+    # and it must look before it makes a call of its own.
+    process, api = make_process()
+    started(process, api)
+    api.helper_gate = threading.Event()
+    seen = calls_by_thread(api)
+    scheduler = threading.Thread(target=process.cancel, args=("deleted",), name="scheduler")
+    started_attempt_in(scheduler, api)
+    lease = threading.Thread(target=process.kill, name="lease")
+    lease.start()
+    time.sleep(0.2)
+    assert lease.is_alive()
+
+    api.helper_gate.set()
+    scheduler.join(5)
+    lease.join(5)
+    assert process._killed and len(api.helpers) == 1
+    assert [call for thread, call in seen if thread == "lease"] == []
+
+
+def test_a_cancel_that_takes_the_lock_just_after_a_slow_attempt_ended_makes_no_attempt() -> None:
+    # The pause is read once before the lock, without it. An attempt on another thread that was slow, did not
+    # kill and released the lock in between has just set it: the check under the lock must see it.
+    process, api = make_process()
+    started(process, api)
+
+    class LockOfASlowAttemptThatJustEnded:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            acquired = self.lock.acquire(blocking, timeout)
+            process._cancel_paused_until = time.monotonic() + 30
+            return acquired
+
+        def release(self) -> None:
+            self.lock.release()
+
+    process._kill_lock = LockOfASlowAttemptThatJustEnded()  # type: ignore[assignment]
+    calls = len(api.calls)
+
+    process.cancel("deleted")
+
+    assert api.calls[calls:] == [] and not process._killed
+    api.stream.end()
+
+
+def test_the_wait_for_another_attempt_covers_a_measured_attempt_and_no_more() -> None:
+    # Longer than the helper's read plus the wait for the run's process and than every attempt measured on Docker
+    # (11.2 s at most); not so long that communicate()'s timeout or the lease loss waits much longer than that.
+    wait = process_module.EXEC_KILL_WAIT_FOR_ATTEMPT_SECONDS
+    assert process_module.EXEC_KILL_HELPER_READ_SECONDS + process_module.EXEC_KILL_START_WAIT_SECONDS < wait
+    assert 11.2 < wait <= 15
+
+
+def test_a_paused_cancel_says_so_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG, logger=process_module.LOG.name)
+    process, api = make_process()
+    started(process, api)
+    process._cancel_paused_until = time.monotonic() + 30
+
+    process.cancel("deleted")
+
+    assert [r.levelno for r in caplog.records if "cancel skips the kill attempt after a slow one" in r.getMessage()] == [logging.DEBUG]
+    api.stream.end()
+
+
+def test_a_one_shot_kill_gives_up_at_its_bound_rather_than_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    # As test_a_one_shot_kill_waits_for_another_attempt_only_up_to_its_bound, but kill() runs on a thread of its
+    # own: a wait without a bound then fails the test instead of hanging the test run (the lock is never freed).
+    monkeypatch.setattr(process_module, "EXEC_KILL_WAIT_FOR_ATTEMPT_SECONDS", 0.3)
+    process, api = make_process()
+    started(process, api)
+    process._kill_lock.acquire()  # an attempt in progress on another thread that does not end in time
+    lease = threading.Thread(target=process.kill, name="lease", daemon=True)
+    try:
+        began = time.monotonic()
+        lease.start()
+        lease.join(5)
+        assert not lease.is_alive() and 0.25 <= time.monotonic() - began < 2
+    finally:
+        process._kill_lock.release()
+        lease.join(5)
+    assert api.helpers == []
+    api.stream.end()
