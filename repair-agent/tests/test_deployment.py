@@ -42,11 +42,15 @@ DOCKERIGNORE_PATTERNS = [
     "**/*.key",
     "**/*.token",
 ]
-# §13: everything the override mounts, all read-only for the agent.
+# §13: everything the override mounts, all read-only for the agent but its own state folder, a named volume where it
+# pins its reviewer (owner decision O9, build step R3 A9).
+STATE_DIR = "/var/lib/cairn-repair/state"
+STATE_VOLUME = "cairn-repair-state"
 AGENT_VOLUMES = [
     "./repair.compose.yaml:/repair-agent/repair.yaml:ro",
     "./secrets/repair-agent.token:/run/secrets/repair-agent.token:ro",
     "./datas/repair-transcripts:/var/lib/cairn-repair/transcripts:ro",
+    f"{STATE_VOLUME}:{STATE_DIR}",
 ]
 
 
@@ -180,6 +184,10 @@ def _check_dockerfile() -> None:
     assert paths, "ENV PATH puts the virtual environment's bin first, so the Compose command finds cairn-repair"
     assert paths[-1].split(":")[0] == "/repair-agent/.venv/bin"
 
+    # R3 A9: the state folder, root's (no USER line) and 0700, which a new cairn-repair-state volume takes on.
+    states = [_words(instruction.arguments) for _, instruction in runs]
+    assert ["install", "-d", "-m", "0700", STATE_DIR] in states, "a RUN line creates the state folder, mode 0700"
+
 
 def _check_dockerignore() -> None:
     """repair-agent/.dockerignore holds the patterns of §9.1, in their order."""
@@ -193,7 +201,8 @@ def _check_compose_override() -> None:
     host.docker.internal:host-gateway entry, mounts only read-only files into it and no model key (§13), and adds
     no .dockerignore at the repository root, whose context today's images use."""
     override = _load_yaml(REPOSITORY / "docker-compose.repair.yaml")
-    assert set(override) == {"services"}
+    assert set(override) == {"services", "volumes"}
+    assert override["volumes"] == {STATE_VOLUME: None}  # a named volume of Compose's defaults, the agent's own
     services = override["services"]
     assert set(services) == {"cairn-server", "cairn-dispatcher", "cairn-repair"}
 
@@ -259,6 +268,17 @@ def test_agent_image_copies_only_the_package() -> None:
     _check_dockerfile()
     _check_dockerignore()
     _check_compose_override()
+
+
+def test_example_configurations_name_the_state_folder() -> None:
+    """R3 A2 and A9 (no catalogue id): both repair*.example.yaml show `state:` / `dir:` with its default, the folder
+    where the agent pins its reviewer, with a one-line comment; in Compose that is where the cairn-repair-state volume
+    is mounted."""
+    for name in ("repair.example.yaml", "repair.compose.example.yaml"):
+        text = (PROJECT / name).read_text(encoding="utf-8")
+        assert _load_yaml(PROJECT / name)["state"] == {"dir": STATE_DIR}, name
+        line = next(line for line in text.splitlines() if line.lstrip().startswith("dir:"))
+        assert "#" in line and "pin" in line.split("#", 1)[1], (name, line)
 
 
 # The example dispatch.yaml that each runbook example goes into, in the README's order: Host (local mode), Compose.

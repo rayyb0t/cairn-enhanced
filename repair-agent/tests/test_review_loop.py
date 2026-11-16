@@ -7,6 +7,7 @@ the Cairn server and the model are loopback stubs (`agentkit`). Every value is s
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -845,6 +847,14 @@ LOG_FORMATS = [
     "transcripts=%s dry_run=%s",
     "repair agent isolation check failed reasons=%s",
     "repair agent running without isolation reasons=%s",
+    "repair reviewer pinned reviewer=%s endpoint=%s",
+    "repair reviewer changed since it was pinned fields=%s pin=%s",
+    "repair reviewer pin unusable path=%s reason=%s",
+    "repair reviewer pin unusable path=%s reason=folder_missing; as root, create the folder with: install -d -m 0700 "
+    "-o %s -g %s %s",
+    "repair reviewer pin: if you changed the reviewer yourself, remove the pin file as root and start the agent again",
+    "repair reviewer pin: the agent cannot use its state folder; check state.dir in repair.yaml, and as root make it "
+    "the agent's own folder with: install -d -m 0700 -o %s -g %s %s",
     "repair agent ignored environment variables names=%s",
     "repair agent token file readable by others file=%s mode=%s",
     "repair reviewer settings are writable by the dispatcher's user, local workers can change them path=%s",
@@ -858,6 +868,8 @@ LOG_FORMATS = [
     "repair model call run=%s reviewer=%s model=%s attempt=%s outcome=%s stop=%s input_tokens=%s prompt_est=%s "
     "output_tokens=%s ms=%s request_id=%s",
     "repair model usage missing, a cut prompt cannot be detected endpoint=%s",
+    "repair model refused a request with the default max_tokens, set max_tokens if the model allows fewer "
+    "reviewer=%s max_tokens=%s status=%s",
     "repair review posted run=%s window=%s decision=%s fallback=%s status=%s truncated=%s",
     "repair review refused run=%s window=%s code=%s",
     "repair agent token rejected status=%s",
@@ -879,6 +891,59 @@ def _check_records(records: list[logging.LogRecord], secrets: list[str]) -> None
         assert any(rule.fullmatch(text) for rule in FORMAT_RULES), text
         for secret in secrets:
             assert secret not in text, (secret, text)
+
+
+LOGGER_METHODS = {"debug", "info", "warning", "error", "exception", "critical", "log"}
+
+
+def _string(node: ast.expr, constants: dict[str, str]) -> str | None:
+    """A string literal, a module-level string constant, or a sum of these; None for anything else."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _string(node.left, constants), _string(node.right, constants)
+        return None if left is None or right is None else left + right
+    return None
+
+
+def _logged_formats() -> list[tuple[str, int, str | None]]:
+    """Every call of a module's `logger` in the agent's package, read from its source: (module, line, format), the
+    format None when only running the code could tell it."""
+    found: list[tuple[str, int, str | None]] = []
+    for path in sorted(Path(cli.__file__).parent.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        constants: dict[str, str] = {}
+        for statement in tree.body:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                target, value = statement.targets[0], _string(statement.value, constants)
+                if isinstance(target, ast.Name) and value is not None:
+                    constants[target.id] = value
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"
+                and node.func.attr in LOGGER_METHODS
+            ):
+                arguments = node.args[1:] if node.func.attr == "log" else node.args
+                found.append((path.name, node.lineno, _string(arguments[0], constants) if arguments else None))
+    return found
+
+
+def test_the_log_catalogue_holds_every_format_the_agent_logs() -> None:
+    """AG40: LOG_FORMATS is §9.11's complete list, the formats of every logger call in the agent's code, each once,
+    and none that the code no longer logs. It is read from the source, so a line that no scenario here produces (a
+    refusal's second line, say) is held to the catalogue too."""
+    found = _logged_formats()
+    assert len(found) > len(LOG_FORMATS) // 2, found  # the scan sees the agent's calls
+    assert [(module, line) for module, line, text in found if text is None] == []  # each format is a literal
+    logged = {text for _, _, text in found if text is not None}
+    assert len(set(LOG_FORMATS)) == len(LOG_FORMATS)
+    assert sorted(logged - set(LOG_FORMATS)) == []  # logged, but not in the catalogue
+    assert sorted(set(LOG_FORMATS) - logged) == []  # in the catalogue, but never logged
 
 
 def test_logs_never_contain_tokens_keys_ids_or_run_text(

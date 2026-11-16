@@ -23,6 +23,11 @@ several socket reads inside urllib3 and http.client (a gzip body whose bytes dec
 so at the deadline it shuts the response's socket for reading, and the attempt is a timeout. Answers are mapped as C-1,
 Answers and Wire formats, say. One `repair model call` line is logged per attempt (§9.11), holding only filtered
 values: never a key, the digest or any answer text.
+
+A reviewer whose settings leave `max_tokens` out gets the default (owner decision O10, `digest.default_max_tokens`),
+which a model that allows fewer output tokens refuses with a 400 or 422 on every request. Such a status stays a
+`model_error`, not retried; it also logs, once per reviewer and process, a WARNING that says to set `max_tokens`. The
+answer's body is never read for it.
 """
 
 from __future__ import annotations
@@ -86,6 +91,11 @@ NO_TIME_LEFT = "no time left for a model call"
 
 _usage_warned: set[str] = set()
 _usage_lock = threading.Lock()
+# The statuses with which a provider refuses a max_tokens above what its model allows (O10), and the reviewers the
+# WARNING about it has been logged for.
+DEFAULT_MAX_TOKENS_REFUSED = frozenset({"status_400", "status_422"})
+_default_max_tokens_warned: set[str] = set()
+_default_max_tokens_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -478,6 +488,25 @@ def _warn_usage_missing(endpoint: str) -> None:
     logger.warning("repair model usage missing, a cut prompt cannot be detected endpoint=%s", endpoint)
 
 
+def _warn_if_the_default_max_tokens_was_refused(reviewer: ReviewerSettings, outcome: str) -> None:
+    """Once per reviewer and process: an attempt whose max_tokens came from the default got a 400 or 422, the
+    statuses with which a provider refuses a max_tokens above what its model allows (O10). Logged from the status
+    alone: an error status's body is never read (C-1)."""
+    if outcome not in DEFAULT_MAX_TOKENS_REFUSED or not reviewer.max_tokens_is_default:
+        return
+    with _default_max_tokens_lock:
+        if reviewer.name in _default_max_tokens_warned:
+            return
+        _default_max_tokens_warned.add(reviewer.name)
+    logger.warning(
+        "repair model refused a request with the default max_tokens, set max_tokens if the model allows fewer "
+        "reviewer=%s max_tokens=%s status=%s",
+        reviewer.name,
+        reviewer.max_tokens,
+        outcome.removeprefix("status_"),
+    )
+
+
 class Reviewer:
     """One reviewer's model call, on its own client, against a deadline on the monotonic clock (§9.4, §9.7)."""
 
@@ -513,6 +542,7 @@ class Reviewer:
             started = self._monotonic()
             last = self._attempt(body, started + limit, limit, prompt_est)
             self._log(run, attempts, last, prompt_est, started)
+            _warn_if_the_default_max_tokens_was_refused(reviewer, last.outcome)
             if not _retryable(last.outcome):
                 break
             if last.outcome != TIMEOUT and attempts < reviewer.max_attempts:

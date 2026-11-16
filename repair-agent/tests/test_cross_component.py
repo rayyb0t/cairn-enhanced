@@ -83,7 +83,7 @@ OPTIONAL_SETTINGS = (
     "price",
 )
 C1_DEFAULTS: dict[str, Any] = {
-    "max_tokens": 4096,
+    "max_tokens": 16384,  # owner decision O10, for a reviewer without context_window, as every one left out is here
     "context_window": None,
     "timeout_seconds": 180,
     "max_attempts": 2,

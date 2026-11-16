@@ -5,7 +5,8 @@
 - The settings file, `<transcripts.root>/agent-settings.json` (`AgentSettings`), which the dispatcher writes at its
   start from the `repair:` section of `dispatch.yaml` (spec §8.3): the server URL, the optional `projects` list and
   the reviewers, each reviewer's key included. It is read once, at the agent's start, with the guards the agent uses
-  for copies.
+  for copies. A reviewer that leaves `max_tokens` out gets its default there, once, from repair.yaml's digest budget
+  (`digest.default_max_tokens`, owner decision O10), so that the agent and the replay resolve the same value.
 
 Every startup error names a field and a rule, never a value, and stops the agent with exit code 2.
 """
@@ -29,6 +30,8 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ModelWrapValidatorHandler,
+    PrivateAttr,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -36,16 +39,20 @@ from pydantic import (
     ValidationError,
     ValidationInfo,
     field_validator,
+    model_validator,
 )
 from pydantic_core import PydanticCustomError
 
-from .digest import MIN_DIGEST_TOKENS, context_window_room
+from .digest import DEFAULT_DIGEST_TOKENS, MIN_DIGEST_TOKENS, context_window_room, default_max_tokens
+from .digest import DEFAULT_MAX_TOKENS as DEFAULT_MAX_TOKENS  # 16384 (owner decision O10); its rule is digest's
 
 logger = logging.getLogger(__name__)
 
 SETTINGS_FILE_NAME = "agent-settings.json"
 SETTINGS_MAX_BYTES = 65536
 SETTINGS_VERSION = 1
+# The validation context's key for repair.yaml's digest budget, which a reviewer's default max_tokens depends on.
+DIGEST_TOKENS_CONTEXT = "digest_tokens"
 CONFIG_MAX_BYTES = 1024 * 1024
 SECRET_FILE_MAX_BYTES = 65536
 TOKEN_MIN_LENGTH = 32
@@ -55,7 +62,6 @@ COPY_MAX_BYTES = 64 * 1024 * 1024
 READABLE_BY_OTHERS = 0o044
 
 DEFAULT_STRUCTURED_OUTPUT = True
-DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_ATTEMPTS = 2
 # The two wire formats of the one model client (owner decision O8, Appendix C-1, Wire formats).
@@ -107,6 +113,8 @@ CONFIG_RULES = {
     "max_staleness_seconds": "must be an integer of at least 0",
     "digest": "must be a mapping",
     "max_tokens_estimate": "must be an integer of at least 1",
+    "state": "must be a mapping",
+    "dir": "must be the absolute path of the agent's state folder, which holds the reviewer pin",
 }
 
 SETTINGS_RULES = {
@@ -274,7 +282,18 @@ class TranscriptsConfig(_Model):
 
 
 class DigestConfig(_Model):
-    max_tokens_estimate: PositiveInt = 8000
+    max_tokens_estimate: PositiveInt = DEFAULT_DIGEST_TOKENS
+
+
+DEFAULT_STATE_DIR = "/var/lib/cairn-repair/state"
+
+
+class StateConfig(_Model):
+    """The live agent's state folder, which holds the reviewer pin (owner decision O9, `pin.py`). It is only named
+    here: the live agent checks it at its start (`isolation.state_dir_reasons`, `pin.check_reviewer_pin`), and the
+    replay and the gate tools, which read this file too, never touch it."""
+
+    dir: AbsolutePathText = DEFAULT_STATE_DIR
 
 
 class AgentConfig(_Model):
@@ -290,8 +309,9 @@ class AgentConfig(_Model):
     max_concurrent_reviews: Annotated[StrictInt, Field(ge=1, le=16)] = 4
     transcripts: TranscriptsConfig
     digest: DigestConfig = DigestConfig()
+    state: StateConfig = StateConfig()
 
-    @field_validator("isolation", "digest", mode="before")
+    @field_validator("isolation", "digest", "state", mode="before")
     @classmethod
     def _empty_section_is_default(cls, value: Any) -> Any:
         return {} if value is None else value
@@ -308,6 +328,12 @@ class ReviewerSettings(_Model):
     `api_format` comes before `api_key` and `structured_output`, whose rules depend on it (§9.2): their validators
     read it from the fields validated before them. With `anthropic_messages` the key is required, and
     `structured_output` must be left out, null or false, and is then false: that call sends no JSON schema.
+
+    `context_window` comes before `max_tokens` for the same reason: a `max_tokens` left out or null takes
+    `digest.default_max_tokens` for this reviewer's `context_window` and the digest budget of repair.yaml, which
+    `parse_settings` passes in the validation context (the default budget without one). So `max_tokens` is the value
+    every request, digest budget and plan of that budget uses (a replay's other `--digest-tokens` budget resolves its
+    own, `replay.reviewer_at`), and `max_tokens_is_default` says whether it came from the default (owner decision O10).
     """
 
     name: Annotated[StrictStr, AfterValidator(_reviewer_name)]
@@ -320,13 +346,43 @@ class ReviewerSettings(_Model):
     )
     # None until validated: left out, it is checked against the format as a null one is, then takes the format's value.
     structured_output: StrictBool = Field(default=None, validate_default=True)
-    max_tokens: PositiveInt = DEFAULT_MAX_TOKENS
     context_window: PositiveInt | None = None
+    # None until validated: left out or null, it takes the default for this reviewer (`_resolve_max_tokens`).
+    max_tokens: PositiveInt = Field(default=None, validate_default=True)
     timeout_seconds: PositiveInt = DEFAULT_TIMEOUT_SECONDS
     max_attempts: PositiveInt = DEFAULT_MAX_ATTEMPTS
     ca_bundle: PathText | None = None
     proxy: Annotated[StrictStr, AfterValidator(_http_url("proxy"))] | None = None
     price: Price | None = None
+    # Whether max_tokens came from the default: set from the validated input (`_remember_a_default_max_tokens`), never
+    # from a key of the file, which extra="forbid" refuses.
+    _max_tokens_default: bool = PrivateAttr(default=False)
+
+    @property
+    def max_tokens_is_default(self) -> bool:
+        """True when the settings file left `max_tokens` out or null, so `max_tokens` is the default (O10)."""
+        return self._max_tokens_default
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_a_default_max_tokens(
+        cls, data: Any, handler: ModelWrapValidatorHandler[ReviewerSettings]
+    ) -> ReviewerSettings:
+        reviewer = handler(data)
+        if isinstance(data, Mapping):
+            reviewer._max_tokens_default = data.get("max_tokens") is None
+        return reviewer
+
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def _resolve_max_tokens(cls, value: Any, info: ValidationInfo) -> Any:
+        """A `max_tokens` left out or null takes `digest.default_max_tokens` for this reviewer (B1, B2); one that is
+        set is kept as written, and checked as before (B3)."""
+        if value is not None:
+            return value
+        context = info.context if isinstance(info.context, Mapping) else {}
+        budget = context.get(DIGEST_TOKENS_CONTEXT, DEFAULT_DIGEST_TOKENS)
+        return default_max_tokens(info.data.get("context_window"), budget)
 
     @field_validator("api_format", mode="before")
     @classmethod
@@ -349,7 +405,7 @@ class ReviewerSettings(_Model):
             raise _rule(NO_SCHEMA_RULE)
         return DEFAULT_STRUCTURED_OUTPUT if value is None else value
 
-    @field_validator("max_tokens", "timeout_seconds", "max_attempts", mode="before")
+    @field_validator("timeout_seconds", "max_attempts", mode="before")
     @classmethod
     def _null_takes_the_default(cls, value: Any, info: ValidationInfo) -> Any:
         if value is None and info.field_name is not None:
@@ -580,8 +636,10 @@ def settings_path(root: str) -> str:
     return os.path.join(root, SETTINGS_FILE_NAME)
 
 
-def load_settings(root: str) -> SettingsFile:
-    """Read `<root>/agent-settings.json` once, safely and strictly (§9.2). Raises StartupError."""
+def load_settings(root: str, *, digest_tokens: int = DEFAULT_DIGEST_TOKENS) -> SettingsFile:
+    """Read `<root>/agent-settings.json` once, safely and strictly (§9.2). Raises StartupError. `digest_tokens` is
+    repair.yaml's `digest.max_tokens_estimate`, which a reviewer's default max_tokens depends on (`parse_settings`):
+    the agent and the replay pass theirs."""
     path = settings_path(root)
 
     def invalid(field: str, rule: str) -> StartupError:
@@ -637,12 +695,14 @@ def load_settings(root: str) -> SettingsFile:
         raw = json.loads(b"".join(chunks))
     except (ValueError, RecursionError):
         raise invalid("file", "is not valid JSON") from None
-    settings = parse_settings(raw, path)
+    settings = parse_settings(raw, path, digest_tokens=digest_tokens)
     return SettingsFile(path=path, settings=settings, uid=info.st_uid, mode=stat.S_IMODE(info.st_mode))
 
 
-def parse_settings(raw: Any, path: str) -> AgentSettings:
-    """Validate decoded settings-file content. Every reviewer is checked, used or not (§9.2)."""
+def parse_settings(raw: Any, path: str, *, digest_tokens: int = DEFAULT_DIGEST_TOKENS) -> AgentSettings:
+    """Validate decoded settings-file content. Every reviewer is checked, used or not (§9.2). A reviewer's max_tokens
+    left out or null is resolved here, once, with `digest_tokens`, repair.yaml's digest budget (O10); the room check
+    below runs on the resolved value."""
 
     def invalid(field: str, rule: str) -> StartupError:
         return StartupError(f"agent settings invalid: {path}: {field}: {rule}")
@@ -653,7 +713,7 @@ def parse_settings(raw: Any, path: str) -> AgentSettings:
     if type(version) is not int or version != SETTINGS_VERSION:
         raise invalid("version", SETTINGS_RULES["version"])
     try:
-        settings = AgentSettings.model_validate(raw)
+        settings = AgentSettings.model_validate(raw, context={DIGEST_TOKENS_CONTEXT: digest_tokens})
     except ValidationError as exc:
         error = _first_error(exc)
         loc = tuple(error["loc"])

@@ -1,10 +1,11 @@
 """`cairn-repair`: the repair agent's entry point and its startup (spec §9.3).
 
 The startup, in order: load `repair.yaml`, read the token and the optional server API key, read the dispatcher's
-settings file; run the isolation check; strip the proxy, CA, netrc and key-log variables from the environment; quiet
-urllib3's logger; build the server client and the first reviewer's model client; log the settings-file WARNINGs and
-the `repair agent started` line. Every startup failure exits with code 2. Then `main` enters the review loop
-(`loop.run_agent`, §9.3 step 7): until SIGINT or SIGTERM, or for one poll with `--once`.
+settings file; run the isolation check, with the state folder's reasons; strip the proxy, CA, netrc and key-log
+variables from the environment; quiet urllib3's logger; log the plain-http and settings-file WARNINGs (§9.3 step 5);
+check the reviewer pin (owner decision O9, `pin.py`), before any client is built; build the server client and the
+first reviewer's model client; log the `repair agent started` line. Every startup failure exits with code 2. Then
+`main` enters the review loop (`loop.run_agent`, §9.3 step 7): until SIGINT or SIGTERM, or for one poll with `--once`.
 
 This module imports neither `requests` nor the clients, nor the loop, at module level: they are imported only after
 the environment guard, so no TLS context or session can ever be made from the variables it removes.
@@ -19,7 +20,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from . import envguard, isolation
+from . import envguard, isolation, pin
 from .config import (
     AgentConfig,
     SettingsFile,
@@ -86,10 +87,12 @@ def start(args: argparse.Namespace) -> StartedAgent:
     config = load_config(config_path)
     token = read_agent_token(config)
     server_api_key = read_server_api_key(config)
-    settings_file = load_settings(config.transcripts.root)
+    # A reviewer's default max_tokens depends on repair.yaml's digest budget (owner decision O10).
+    settings_file = load_settings(config.transcripts.root, digest_tokens=config.digest.max_tokens_estimate)
     settings = settings_file.settings
 
-    reasons = isolation.check(config, config_path, settings_file)
+    # The live agent's state folder, which holds the reviewer pin, is checked at its start only (O9).
+    reasons = isolation.check(config, config_path, settings_file) + isolation.state_dir_reasons(config.state.dir)
     if args.allow_shared_user:
         logger.warning("repair agent running without isolation reasons=%s", ",".join(reasons) or "none")
     elif reasons:
@@ -102,11 +105,8 @@ def start(args: argparse.Namespace) -> StartedAgent:
     from .model import build_model_client, endpoint_of, warn_if_plain_http
     from .server import RepairServerClient
 
-    server = RepairServerClient(settings.server, token, api_key=server_api_key, ca_bundle=config.server_ca_bundle)
     reviewer = settings.reviewers[0]  # the live agent reviews with the first reviewer (§8.3, §9.7)
-    model = build_model_client(reviewer)
     warn_if_plain_http(reviewer)
-
     if settings_file.uid != 0:
         logger.warning(
             "repair reviewer settings are writable by the dispatcher's user, local workers can change them path=%s",
@@ -118,6 +118,12 @@ def start(args: argparse.Namespace) -> StartedAgent:
             settings_file.path,
             f"{settings_file.mode:04o}",
         )
+
+    # The reviewer pin, before any client is built or any request sent (O9): a changed reviewer stops the agent here,
+    # after the WARNINGs above, which say who can change the reviewer.
+    pin.check_reviewer_pin(config.state.dir, reviewer, endpoint_of(reviewer.base_url))
+    server = RepairServerClient(settings.server, token, api_key=server_api_key, ca_bundle=config.server_ca_bundle)
+    model = build_model_client(reviewer)
 
     # The digest budget; a reviewer's context_window lowers it (Appendix C-1, Digest budget).
     digest_tokens = digest_budget(config.digest.max_tokens_estimate, reviewer.context_window, reviewer.max_tokens)

@@ -329,7 +329,11 @@ def test_smoke_shadow(
                 }
             ]
 
-            # The agent, as cairn-repair runs, on its own repair.yaml and the dispatcher's settings file.
+            # The agent, as cairn-repair runs, on its own repair.yaml and the dispatcher's settings file, with its
+            # own state folder, where it pins its reviewer (owner decision O9).
+            state = tmp_path / "agent-state"
+            state.mkdir(mode=0o700)
+            state.chmod(0o700)
             repair_yaml = tmp_path / "repair.yaml"
             repair_yaml.write_text(
                 yaml.safe_dump(
@@ -338,6 +342,7 @@ def test_smoke_shadow(
                         "dispatch_config_to_check": str(dispatch_path),
                         "poll_interval": 2,
                         "transcripts": {"root": str(root)},
+                        "state": {"dir": str(state)},
                     }
                 ),
                 encoding="utf-8",

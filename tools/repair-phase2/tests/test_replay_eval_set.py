@@ -395,7 +395,8 @@ def test_replay_refuses_without_yes_and_prints_each_reviewers_ceiling(
     assert code == 1
     planned = [line_values(line) for line in stdout.splitlines() if line.startswith("planned ")]
     assert [line["reviewer"] for line in planned] == ["priced", "local"]
-    for line, max_tokens in zip(planned, (4096, 2048), strict=True):
+    # "priced" leaves max_tokens out: the plan counts its resolved default, 16384 without a context_window (O10).
+    for line, max_tokens in zip(planned, (16384, 2048), strict=True):
         name = line["reviewer"]
         digests = sorted((out / "digests" / name).iterdir())
         assert int(line["calls"]) == len(digests) == 6

@@ -9,3 +9,6 @@ RUN chmod -R go-w /repair-agent/pyproject.toml /repair-agent/uv.lock /repair-age
 WORKDIR /repair-agent
 RUN uv sync --frozen --no-dev
 ENV PATH="/repair-agent/.venv/bin:$PATH"
+# The agent's state folder, where it pins its reviewer: root's (the agent runs as root here), mode 0700. Compose mounts
+# the named volume cairn-repair-state here, which takes this folder's owner and mode when it is created.
+RUN install -d -m 0700 /var/lib/cairn-repair/state

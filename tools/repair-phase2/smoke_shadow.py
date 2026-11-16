@@ -268,7 +268,7 @@ class Layout:
 
     def write(self) -> str:
         """Every file of the smoke; returns the agent token."""
-        for folder in ("bin", "home", "claude-config", "work", "copies", "secrets", "state", "logs"):
+        for folder in ("bin", "home", "claude-config", "work", "copies", "secrets", "state", "agent-state", "logs"):
             self.path(folder).mkdir(mode=0o700)
         self.path("copies").chmod(0o750)
         fake = self.path("bin", "claude")
@@ -298,12 +298,15 @@ class Layout:
             f'        REVIEW_BASE_URL: "{self.reviewer_url}"\n',
             encoding="utf-8",
         )
+        self.path("agent-state").chmod(0o700)  # where the agent pins its reviewer: its own, 0700
         self.path("repair.yaml").write_text(
             f'token_file: "{self.path("secrets", "agent.token")}"\n'
             f'dispatch_config_to_check: "{self.path("dispatch.yaml")}"\n'
             "poll_interval: 2\n"
             "transcripts:\n"
-            f'  root: "{self.path("copies")}"\n',
+            f'  root: "{self.path("copies")}"\n'
+            "state:\n"
+            f'  dir: "{self.path("agent-state")}"\n',
             encoding="utf-8",
         )
         return agent_token

@@ -104,12 +104,16 @@ _CONTROL_TOKEN = re.compile(
 # --- tokens and budget --------------------------------------------------------------------------------------------------
 
 
+ASCII_CHARACTERS_PER_TOKEN = 3  # §9.6's estimate: ASCII characters ÷ 3, rounded up
+MAX_BYTES_PER_CHARACTER = 4  # UTF-8's longest character; any non-ASCII character is one token of the estimate
+
+
 def estimate_tokens(text: str) -> int:
     """§9.6's estimate, the digest budget's measure: ASCII characters ÷ 3 (rounded up) plus one token per non-ASCII
     character. It is calibrated, not a bound: digits, tabs and newlines are one token each to the tokenizers that split
     them one by one, and a rare character is several. `token_bound` is the bound."""
     ascii_count = len(text.encode("ascii", "ignore"))
-    return -(-ascii_count // 3) + (len(text) - ascii_count)
+    return -(-ascii_count // ASCII_CHARACTERS_PER_TOKEN) + (len(text) - ascii_count)
 
 
 def token_bound(text: str) -> int:
@@ -183,6 +187,41 @@ def digest_budget(max_tokens_estimate: int, context_window: int | None, max_toke
         return DigestBudget(max_tokens_estimate)
     room = context_window_room(context_window, max_tokens)
     return DigestBudget(min(max_tokens_estimate, room), room)
+
+
+# A reviewer's max_tokens when its settings leave it out (owner decision O10): room for a reasoning model's thinking
+# plus the JSON answer. With a context_window the default is lowered, never below SMALL_CONTEXT_MAX_TOKENS, the default
+# before O10, so that it never changes a digest (`default_max_tokens`).
+DEFAULT_MAX_TOKENS = 16384
+SMALL_CONTEXT_MAX_TOKENS = 4096
+# K: the most UTF-8 bytes, `token_bound`'s measure, that a digest holds per token of §9.6's estimate, the measure of
+# its budget. The budget covers the whole digest, the header, every line with its line break, the closing tag and the
+# cut note (`_Body`, `_cut_body`), and it is checked on all of it at once (`_fits`): ceil(ascii / 3) + other <= budget.
+# An ASCII character is 1 byte and a third of an estimated token, so ascii <= 3 * ceil(ascii / 3); any other character
+# is 1 estimated token and at most 4 bytes (`surrogatepass` encodes a lone surrogate in 3). So a digest within its
+# budget is at most 3 * ceil(ascii / 3) + 4 * other <= 4 * budget bytes, and 4 is reached: a text of 4-byte characters.
+DIGEST_BYTES_PER_TOKEN = max(ASCII_CHARACTERS_PER_TOKEN, MAX_BYTES_PER_CHARACTER)
+
+
+def default_max_tokens(context_window: int | None, max_tokens_estimate: int) -> int:
+    """The max_tokens of a reviewer whose settings leave it out (owner decision O10, build step R3, B1 and B2): the one
+    rule, used wherever a reviewer's max_tokens is resolved (`config.ReviewerSettings`, and `replay.reviewer_at` for
+    a replay's other `--digest-tokens` budget).
+
+    Without a `context_window` (a hosted API), DEFAULT_MAX_TOKENS. With one (a local server), the default must never
+    change the digest the reviewer gets with SMALL_CONTEXT_MAX_TOKENS: every larger max_tokens shrinks the room the
+    context leaves for the digest (`context_window_room`). So it rises above SMALL_CONTEXT_MAX_TOKENS only while that
+    room stays at least DIGEST_BYTES_PER_TOKEN times the budget: then no digest within its budget reaches the room,
+    the room never cuts one, and every digest is byte for byte the one built with SMALL_CONTEXT_MAX_TOKENS. The room
+    also stays at least MIN_DIGEST_TOKENS, so the room check refuses exactly the contexts it refuses at
+    SMALL_CONTEXT_MAX_TOKENS, for a budget under MIN_DIGEST_TOKENS / DIGEST_BYTES_PER_TOKEN too. With the default
+    budget of 8,000 that is SMALL_CONTEXT_MAX_TOKENS up to a context of about 37,300 tokens, and DEFAULT_MAX_TOKENS
+    from about 49,600."""
+    if context_window is None:
+        return DEFAULT_MAX_TOKENS
+    kept_room = max(DIGEST_BYTES_PER_TOKEN * max_tokens_estimate, MIN_DIGEST_TOKENS)
+    fits = context_window - SYSTEM_PROMPT_TOKENS - kept_room
+    return min(DEFAULT_MAX_TOKENS, max(SMALL_CONTEXT_MAX_TOKENS, fits))
 
 
 # --- cleaning ---------------------------------------------------------------------------------------------------------
@@ -848,7 +887,7 @@ class _Body:
 def _fits(ascii_count: int, other: int, other_bytes: int, budget: int, room: int | None) -> bool:
     """Whether text of these characters is within the budget by §9.6's estimate, and within the room by
     `token_bound` (its UTF-8 bytes) when there is one."""
-    if -(-ascii_count // 3) + other > budget:
+    if -(-ascii_count // ASCII_CHARACTERS_PER_TOKEN) + other > budget:
         return False
     return room is None or ascii_count + other_bytes <= room
 

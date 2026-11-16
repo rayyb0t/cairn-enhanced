@@ -1409,7 +1409,7 @@ ERROR   repair module unavailable, running today's explore task project=%s      
 | `repair.reviewers[].env.REVIEW_API_KEY` | 否 | 评审模型自己的 key（`anthropic_messages` 必填）；去掉首尾的 ASCII 空白，可打印 ASCII |
 | `repair.reviewers[].api_format` | 否 | `openai_chat`（默认）或 `anthropic_messages` |
 | `repair.reviewers[].structured_output` | 否 | 布尔值，修复代理默认 true；只用于 `openai_chat` |
-| `repair.reviewers[].max_tokens` | 否 | ≥ 1 的整数，修复代理默认 4096 |
+| `repair.reviewers[].max_tokens` | 否 | ≥ 1 的整数；不写时修复代理默认 16384，设置了 `context_window` 时更低，不低于 4096（见 `docs/specs/repair-agent.md`「评审模型设置」） |
 | `repair.reviewers[].context_window` | 否 | ≥ 1 的整数，默认 null；服务端给该评审模型的上下文（token），决定发给它的 digest 预算与 room（每个 digest 的 UTF-8 字节上限）。本地模型服务（例如 Ollama，会悄悄截断超过其上下文的 prompt）必须设置为服务端真正的上下文，绝不能更大（见 `docs/specs/repair-agent.md`「digest 预算」）；默认 null 只适合不会截断 prompt 的服务端 |
 | `repair.reviewers[].timeout_seconds` | 否 | ≥ 1 的整数，默认 180；每次尝试的时限 |
 | `repair.reviewers[].max_attempts` | 否 | ≥ 1 的整数，默认 2 |

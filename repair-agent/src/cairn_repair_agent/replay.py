@@ -31,6 +31,10 @@ Per intent folder of the eval set (`<eval>/<intent>/intent.json`, Phase 0's `exp
    review whose first attempt timed out counts the time a live review would also have spent on it (§15.5,
    `calls_over`). It is null when no attempt was made.
 
+Each digest budget (repair.yaml's, or each of `--digest-tokens`) is reviewed as a live agent with that budget in its
+repair.yaml would review it (`reviewer_at`): a reviewer that leaves `max_tokens` out gets that budget's default (owner
+decision O10), in its room, its requests and the plan line, and one that sets it gets it as written.
+
 Digests are built once per case and repetition, with one nonce, and shared by every reviewer of the same digest
 budget, so each reviewer gets the same bytes. Every reviewer's key, and the agent's own secrets, are removed from every
 digest (§9.6 step 3), so no reviewer receives another's key. Before any call, with every digest built, one
@@ -73,7 +77,17 @@ from .config import (
     read_agent_token,
     read_server_api_key,
 )
-from .digest import Digest, Fact, ReviewContext, build_digest, digest_budget, facts_for_run, prompt_tokens_estimate
+from .digest import (
+    Digest,
+    DigestBudget,
+    Fact,
+    ReviewContext,
+    build_digest,
+    default_max_tokens,
+    digest_budget,
+    facts_for_run,
+    prompt_tokens_estimate,
+)
 from .gate import GateInputError, load_labels
 from .redact import ExactSecrets
 from .transcripts import EDIT, WRITE, Transcript, detect_cli, parse_transcript
@@ -578,14 +592,31 @@ def select_reviewers(all_reviewers: Sequence[ReviewerSettings], names: Sequence[
     return [reviewer for reviewer in all_reviewers if reviewer.name in wanted]
 
 
-def budgets_for(reviewer: ReviewerSettings, requested: Sequence[int]) -> list[int]:
-    """The reviewer's digest budgets: each requested budget, lowered by its `context_window` (C-1, Digest budget),
+def reviewer_at(reviewer: ReviewerSettings, requested: int) -> ReviewerSettings:
+    """The reviewer as a live agent whose repair.yaml has the digest budget `requested` reads it: a `max_tokens` left
+    out takes `digest.default_max_tokens` for that budget (owner decision O10, the one rule), and one that is set is
+    kept as written. With repair.yaml's own budget that is the reviewer `load_setup` read. A budget of `--digest-tokens`
+    other than repair.yaml's gets its own default, so that its room, its digests and its requests are those of a live
+    agent with that budget (§15.3), not those of the max_tokens repair.yaml's budget gives: with a `context_window`,
+    a larger budget can get a lower default, and so a larger room, and a smaller budget a higher one."""
+    if not reviewer.max_tokens_is_default:
+        return reviewer
+    max_tokens = default_max_tokens(reviewer.context_window, requested)
+    if max_tokens == reviewer.max_tokens:
+        return reviewer
+    return reviewer.model_copy(update={"max_tokens": max_tokens})
+
+
+def budgets_for(reviewer: ReviewerSettings, requested: Sequence[int]) -> list[tuple[DigestBudget, ReviewerSettings]]:
+    """The reviewer's digest budgets, each with the reviewer as a live agent with that budget has it (`reviewer_at`):
+    each requested budget, lowered by its `context_window` (C-1, Digest budget) with the room that max_tokens leaves,
     each distinct one once."""
-    found: list[int] = []
+    found: list[tuple[DigestBudget, ReviewerSettings]] = []
     for value in requested:
-        budget = digest_budget(value, reviewer.context_window, reviewer.max_tokens)
-        if budget not in found:
-            found.append(budget)
+        settings = reviewer_at(reviewer, value)
+        budget = digest_budget(value, settings.context_window, settings.max_tokens)
+        if all(budget != seen for seen, _ in found):
+            found.append((budget, settings))
     return found
 
 
@@ -628,6 +659,15 @@ class _Built:
     repetition: int
     budget: int
     digest: Digest = field(repr=False)
+
+
+@dataclass
+class _Planned:
+    """A reviewer's calls at one of its digest budgets, with the reviewer as a live agent with that budget has it
+    (`reviewer_at`): their requests carry its max_tokens, and the plan counts it."""
+
+    settings: ReviewerSettings
+    calls: list[_Built] = field(default_factory=list)
 
 
 def build_digests(
@@ -853,11 +893,14 @@ def agent_logging() -> Iterator[AttemptLines]:
 
 
 def load_setup(args: argparse.Namespace) -> ReplaySetup:
-    """repair.yaml, the agent's secrets and the settings file, as the agent reads them (§9.3 step 1). StartupError."""
+    """repair.yaml, the agent's secrets and the settings file, as the agent reads them (§9.3 step 1), so each
+    reviewer's max_tokens resolves as the live agent's does, with repair.yaml's digest budget (O10); a budget of
+    `--digest-tokens` other than it resolves its own (`reviewer_at`). It never touches repair.yaml's state folder: only
+    the live agent pins its reviewer (O9). StartupError."""
     config = load_config(args.config)
     token = read_agent_token(config)
     server_api_key = read_server_api_key(config)
-    settings = load_settings(config.transcripts.root).settings
+    settings = load_settings(config.transcripts.root, digest_tokens=config.digest.max_tokens_estimate).settings
     exact = ExactSecrets.for_agent(token, [reviewer.api_key for reviewer in settings.reviewers], server_api_key)
     return ReplaySetup(config=config, reviewers=settings.reviewers, exact=exact)
 
@@ -936,7 +979,7 @@ def _run(
 
     requested = args.digest_tokens or [setup.config.digest.max_tokens_estimate]
     reviewer_budgets = {reviewer.name: budgets_for(reviewer, requested) for reviewer in reviewers}
-    every_budget = sorted({budget for budgets in reviewer_budgets.values() for budget in budgets})
+    every_budget = sorted({budget for budgets in reviewer_budgets.values() for budget, _ in budgets})
 
     # The environment guard, before any model client exists (§9.3 steps 3 and 4).
     from . import envguard
@@ -953,24 +996,27 @@ def _run(
         slice_seconds=args.slice_seconds,
         probe=stuck,
     )
-    plan: list[tuple[ReviewerSettings, list[_Built]]] = []
+    plan: list[tuple[ReviewerSettings, list[_Planned]]] = []
     for reviewer in reviewers:
         budgets = reviewer_budgets[reviewer.name]
         folder = out / DIGESTS_FOLDER / reviewer.name
         folder.mkdir(mode=0o750, parents=True, exist_ok=True)
-        calls: list[_Built] = []
-        for budget in budgets:
+        groups: list[_Planned] = []
+        for budget, settings in budgets:
+            group = _Planned(settings)
             for repetition in range(1, args.repetitions + 1):
                 for case in cases:
                     for injected in (False, True) if stuck(case) else (False,):
                         item = built[(case.intent_id, repetition, injected, budget)]
-                        calls.append(item)
+                        group.calls.append(item)
                         name = digest_file_name(case.intent_id, repetition, injected, budget, len(budgets) > 1)
                         _write_file(folder / name, item.digest.text.encode("utf-8"))
-        plan.append((reviewer, calls))
-    for reviewer, calls in plan:
+            groups.append(group)
+        plan.append((reviewer, groups))
+    for reviewer, groups in plan:
+        calls = [item for group in groups for item in group.calls]
         max_input = sum(prompt_tokens_estimate(item.digest.text) for item in calls)
-        max_output = len(calls) * reviewer.max_tokens
+        max_output = sum(len(group.calls) * group.settings.max_tokens for group in groups)  # each budget's max_tokens
         price = reviewer.price
         if price is None:
             ceiling = "no_price"
@@ -995,26 +1041,27 @@ def _run(
         probed = decisions
         if args.inject:
             probed = files.enter_context(os.fdopen(os.open(out / INJECTED_FILE, flags, 0o640), "w", encoding="ascii"))
-        for reviewer_settings, calls in plan:
+        for reviewer_settings, groups in plan:
             warn_if_plain_http(reviewer_settings)
-            reviewer = Reviewer(build_model_client(reviewer_settings), monotonic=monotonic, sleep=sleep)
             counts = {"calls": 0, "fallbacks": 0}
-            try:
-                for item in calls:
-                    record = review_record(
-                        reviewer,
-                        item,
-                        seconds=seconds_left(item.case.budget_seconds, setup.config.poll_interval),
-                        lines=lines,
-                        monotonic=monotonic,
-                    )
-                    target = probed if item.case.injected else decisions
-                    target.write(json.dumps(record, ensure_ascii=True) + "\n")
-                    target.flush()
-                    counts["calls"] += 1
-                    counts["fallbacks"] += record["fallback"] is not None
-            finally:
-                reviewer.client.session.close()
+            for group in groups:  # a model client per budget, whose requests carry that budget's max_tokens
+                reviewer = Reviewer(build_model_client(group.settings), monotonic=monotonic, sleep=sleep)
+                try:
+                    for item in group.calls:
+                        record = review_record(
+                            reviewer,
+                            item,
+                            seconds=seconds_left(item.case.budget_seconds, setup.config.poll_interval),
+                            lines=lines,
+                            monotonic=monotonic,
+                        )
+                        target = probed if item.case.injected else decisions
+                        target.write(json.dumps(record, ensure_ascii=True) + "\n")
+                        target.flush()
+                        counts["calls"] += 1
+                        counts["fallbacks"] += record["fallback"] is not None
+                finally:
+                    reviewer.client.session.close()
             _write(
                 f"replayed reviewer={reviewer_settings.name} calls={counts['calls']} fallbacks={counts['fallbacks']}"
             )

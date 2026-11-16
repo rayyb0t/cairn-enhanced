@@ -227,7 +227,7 @@ def test_reviewer_settings_rules_defaults(layout: Layout) -> None:
     for reviewer in settings.reviewers:
         assert reviewer.api_key is None
         assert reviewer.structured_output is True
-        assert reviewer.max_tokens == 4096
+        assert reviewer.max_tokens == 16384  # owner decision O10: 4096 before it, for a reviewer without context_window
         assert reviewer.context_window is None
         assert reviewer.timeout_seconds == 180
         assert reviewer.max_attempts == 2
@@ -571,6 +571,7 @@ def test_example_configurations_hold_only_the_agents_own_settings(
     for name, example in (("compose", compose), ("host", host)):
         example = dict(example, token_file=str(layout.token_path))
         example["transcripts"] = dict(example["transcripts"], root=str(layout.root))
+        example["state"] = dict(example["state"], dir=str(layout.state_dir))  # R3: the pin's folder, moved here too
         layout.write_config(example)
         code, stderr = run_main(layout, capsys, "--allow-shared-user", "--once")
         if name == "compose":

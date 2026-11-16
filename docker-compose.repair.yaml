@@ -35,4 +35,8 @@ services:
       - ./repair.compose.yaml:/repair-agent/repair.yaml:ro
       - ./secrets/repair-agent.token:/run/secrets/repair-agent.token:ro
       - ./datas/repair-transcripts:/var/lib/cairn-repair/transcripts:ro
+      - cairn-repair-state:/var/lib/cairn-repair/state   # the agent's own state folder: its reviewer pin
     command: ["cairn-repair", "--config", "/repair-agent/repair.yaml"]
+
+volumes:
+  cairn-repair-state:                         # created root's, 0700, from the image's folder

@@ -13,6 +13,7 @@ from __future__ import annotations
 import errno
 import os
 import pwd
+import stat
 import sysconfig
 
 from .config import AgentConfig, SettingsFile
@@ -168,4 +169,25 @@ def check(config: AgentConfig, config_path: str, settings_file: SettingsFile) ->
     # The settings file belongs to the dispatcher's user by design (O1): root or the copy root's owner.
     if changeable_by_others(settings_file.path, frozenset({0, root_uid})):
         reasons.append("settings_writable")
+    return reasons
+
+
+def state_dir_reasons(state_dir: str) -> list[str]:
+    """The reasons of the live agent's state folder, which holds the reviewer pin (owner decision O9), in their order
+    after `settings_writable`: a symlink (`os.lstat`), a folder the agent's effective uid does not own, or one that is
+    group- or world-writable (the folder a symlink names, for these two). Another user, or a local worker, who can
+    replace the folder or write in it could replace the pin. Only the live agent's start checks it (`cli.start`); a
+    missing folder, or the agent's own folder whose mode lacks u+rwx, is not a reason: the pin step refuses it
+    (`pin.check_reviewer_pin`)."""
+    reasons: list[str] = []
+    try:
+        if stat.S_ISLNK(os.lstat(state_dir).st_mode):
+            reasons.append("state_dir_symlink")
+        info = os.stat(state_dir)
+    except (OSError, ValueError):
+        return reasons
+    if info.st_uid != os.geteuid():
+        reasons.append("state_dir_owner")
+    if info.st_mode & GROUP_OR_WORLD_WRITABLE:
+        reasons.append("state_dir_writable")
     return reasons

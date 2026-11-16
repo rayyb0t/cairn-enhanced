@@ -29,6 +29,7 @@ elsewhere.
 | The agent's own configuration | `/etc/cairn-repair/repair.yaml` (`root:cairn-repair`, 0640), from `repair-agent/repair.example.yaml` | `./repair.compose.yaml`, from `repair-agent/repair.compose.example.yaml` |
 | Copy root: transcript copies, and the agent's settings file `agent-settings.json` | `/var/lib/cairn-repair/transcripts` (yours, group `cairn-repair`, 2750) | `./datas/repair-transcripts`, mounted read-only into the agent |
 | The agent's code | `/opt/cairn-repair` (root's, readable by everyone) | the `cairn-repair-agent` image, built from `repair-agent/` alone |
+| The agent's state folder: its reviewer pin, `reviewer-pin.json` | `/var/lib/cairn-repair/state` (`cairn-repair`, 0700) | the `cairn-repair-state` volume (root's, 0700) |
 
 There is exactly one place for a reviewer's key: its entry in the `repair:` section of
 `dispatch.yaml`. The agent never reads `dispatch.yaml`, which also holds your workers' settings: the
@@ -154,12 +155,14 @@ repair:
   reviewers:
     - name: "reviewer_claude"
       api_format: anthropic_messages                   # the Claude Messages API
+      # max_tokens left out: 16384, room for a reasoning model's thinking (below)
       env:
         REVIEW_MODEL: "<model name>"
         REVIEW_API_KEY: "<your Claude API key>"        # between REVIEW_MODEL and REVIEW_BASE_URL
         REVIEW_BASE_URL: "https://api.anthropic.com"   # without /v1
     - name: "reviewer_openai_compatible"               # api_format left out: openai_chat
       context_window: 16384                            # a model server's context, never more (below)
+      # max_tokens left out: 4096 with this context_window, so the digest keeps its room (below)
       env:
         REVIEW_MODEL: "<model name>"
         REVIEW_API_KEY: "<that provider's key for the reviewer>"
@@ -177,12 +180,14 @@ repair:
   reviewers:
     - name: "reviewer_claude"
       api_format: anthropic_messages
+      # max_tokens left out: 16384 (below)
       env:
         REVIEW_MODEL: "<model name>"
         REVIEW_API_KEY: "<your Claude API key>"        # between REVIEW_MODEL and REVIEW_BASE_URL
         REVIEW_BASE_URL: "https://api.anthropic.com"
     - name: "reviewer_openai_compatible"
       context_window: 16384                            # a model server's context, never more (below)
+      # max_tokens left out: 4096 with this context_window (below)
       env:
         REVIEW_MODEL: "<model name>"
         REVIEW_API_KEY: "<that provider's key for the reviewer>"
@@ -208,6 +213,25 @@ A reviewer's optional settings sit beside its `env`: `timeout_seconds`, `max_tok
 (`input_per_mtok` and `output_per_mtok`, the price per million tokens, for the replay's cost ceiling).
 Left out, each has its default. A `ca_bundle` is a path the agent opens: on a host a file in
 `/etc/cairn-repair/` (step 4 d), in Compose a file you mount read-only into `cairn-repair`.
+
+**`max_tokens`**, the most tokens a reviewer may write per answer, defaults to 16384. A reasoning
+model spends part of it thinking before its JSON answer, and stops at the limit before the answer if
+the limit is too low, which makes the review `invalid_output` (`max_tokens`). It is a cap, not a
+target: a provider bills the tokens the model actually writes. With `context_window` set (a model
+server on your machine, below), the default is lower, so that the digest keeps all of its room and
+is exactly what it is with 4096: 4096 up to a context of about 37,300 tokens, 16384 from about
+49,600, and in between what the context leaves after the system prompt and four times the digest
+budget (with the default `digest.max_tokens_estimate` of 8000; a context of 40,000 gives 6,762). Some
+models allow fewer output tokens than 16384 (some allow 4096 or 8192); their provider answers every
+request with HTTP 400 (or 422), and the agent then logs, once per reviewer,
+
+```
+repair model refused a request with the default max_tokens, set max_tokens if the model allows fewer reviewer=<name> max_tokens=16384 status=400
+```
+
+Set that reviewer's `max_tokens` to its model's limit. A `max_tokens` you set is used as written.
+`max_tokens` is never pinned (step 4, "Accepting a reviewer change"), so changing it never needs the
+pin removed.
 
 **A model server on this host needs `context_window`**, the context in tokens that the server gives
 the model. Give the server a context of at least 16,384 tokens (Ollama: `OLLAMA_CONTEXT_LENGTH=16384`
@@ -304,11 +328,13 @@ is you, in your checkout.
 sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin cairn-repair
 ```
 
-**b. The copy root**, outside your home, and your membership of its group:
+**b. The copy root**, outside your home, and your membership of its group; and the agent's own state
+folder, where it pins its reviewer (step 4 f):
 
 ```bash
 sudo install -d -m 0755 /var/lib/cairn-repair
 sudo install -d -m 2750 -o "$USER" -g cairn-repair /var/lib/cairn-repair/transcripts
+sudo install -d -m 0700 -o cairn-repair -g cairn-repair /var/lib/cairn-repair/state
 sudo usermod -aG cairn-repair "$USER"
 ```
 
@@ -377,8 +403,9 @@ which your user, and so a local worker, can read. No model key goes here: a revi
 
 In `repair.yaml` (edit it with `sudoedit`, which keeps its owner and mode):
 
-- `token_file: "/etc/cairn-repair/agent.token"` and `transcripts.root:
-  "/var/lib/cairn-repair/transcripts"`, as in the example.
+- `token_file: "/etc/cairn-repair/agent.token"`, `transcripts.root:
+  "/var/lib/cairn-repair/transcripts"` and `state.dir: "/var/lib/cairn-repair/state"` (the folder of
+  step 4 b), as in the example.
 - `dispatch_config_to_check`: the absolute path of the dispatcher's `dispatch.yaml` (mode 0600), such
   as `/home/<you>/cairn/dispatch.yaml`. The agent checks at its start that it cannot read it.
 - `isolation.unreadable_paths`: the absolute path of `secrets/repair-dispatcher.token`, such as
@@ -443,6 +470,29 @@ change it too (and read the reviewers' keys in it and in `dispatch.yaml`). Phase
 because nothing is applied; the reviewer's settings must be protected before Phase 3 applies
 anything.
 
+**The reviewer pin** limits what such a change can do. At its first start the agent remembers its
+reviewer, the first entry of the `repair:` section: its name, address (`REVIEW_BASE_URL`), format
+(`api_format`), model, `proxy` and `ca_bundle`, in `/var/lib/cairn-repair/state/reviewer-pin.json`
+(step 4 b), a file only `cairn-repair` and root can change. It logs
+
+```
+repair reviewer pinned reviewer=reviewer_claude endpoint=https://api.anthropic.com:443
+```
+
+and at every later start it compares the reviewer with the pin. If any of these six changed, it
+refuses to start instead of sending a digest anywhere new (see "Accepting a reviewer change" below).
+So a worker that points the reviewer at a listener of its own stops the agent rather than
+redirecting it. The pin's limits: it stops a worker from redirecting the live agent's reviewer. It
+does not stop a worker from reading the reviewers' keys in `dispatch.yaml` or the settings file, or
+from changing the other settings: `server`, the Cairn address to which the agent sends its token and
+every digest and raw output it posts (a worker that points it at a listener of its own receives
+them), `max_tokens`, `timeout_seconds`, the `projects` list, a second reviewer. Only the live agent
+checks the pin: the gate replay (`replay_eval_set.py`) and the gate report never do, and the replay
+sends the eval set's digests to every reviewer as the settings file names it. So before a replay
+with `--yes`, look at each reviewer's `base_url`, `proxy` and `ca_bundle` in the settings file it
+reads, `agent-settings.json` in the copy root. And the pin does not hold if your user can run `sudo`
+without a password, because a worker could then remove the pin itself.
+
 ### Check
 
 The agent logs `repair agent started … reviewer=<your first reviewer> … projects=all`, for example:
@@ -474,6 +524,52 @@ start with `agent settings missing: …` (start the dispatcher with its `repair:
 | `secret_writable` | `agent.token` can be changed by another user (step 4 d). |
 | `package_writable` | The agent's code can be changed by another user: repeat step 4 c's `chown` and `chmod`. |
 | `settings_writable` | `agent-settings.json` belongs to someone other than you or root, or is group- or world-writable. The dispatcher writes it 0640; do not change it by hand. |
+| `state_dir_symlink` | The state folder (`state.dir`, `/var/lib/cairn-repair/state`) is a symlink: make it a real folder (step 4 b). |
+| `state_dir_owner` | The state folder is not owned by the agent's user: `sudo chown cairn-repair:cairn-repair /var/lib/cairn-repair/state`. In Compose it is root's, which `up -d --build` sets up for the agent, root there; a non-root agent needs a folder of its own instead of the volume (Compose notes, "A non-root agent"). |
+| `state_dir_writable` | The state folder is group- or world-writable: `sudo chmod 0700 /var/lib/cairn-repair/state`. |
+
+The reviewer pin stops the agent with one of two lines, followed by
+`repair reviewer pin: if you changed the reviewer yourself, remove the pin file as root and start the agent again`,
+but for `folder_missing` and `write_failed`, which leave no pin file to remove, and a state folder the
+agent cannot use, which gets the folder's own remedy (below):
+
+| Line | What to fix |
+| --- | --- |
+| `repair reviewer changed since it was pinned fields=<fields> pin=<path>` | The named fields of the first reviewer differ from the pin (never their values). See "Accepting a reviewer change" below. |
+| `repair reviewer pin unusable path=<path> reason=<reason>` | The pin cannot be used. `folder_missing`: the state folder does not exist; the line names the `install -d -m 0700 …` command that creates it, which you run as root (step 4 b). `not_a_regular_file` (a symlink, a FIFO or a folder in its place), `owner_or_mode` (not the agent user's own, or group- or world-writable), `too_large` (over 64 KiB), `malformed` (not UTF-8 JSON of the pin's shape), `wrong_version` and `unreadable:<errno>`: something other than the agent wrote it; look at it, then remove it as root. `unreadable:<errno>` for the state folder itself, which is there but not a folder the agent can use (`EACCES`: another user's, or the agent user's own with a mode that does not give that user read, search and write, such as 0600 or 0500, which the agent checks before it reads or writes the pin; `ENOTDIR`: `state.dir` names a file): the second line is `repair reviewer pin: the agent cannot use its state folder; check state.dir in repair.yaml, and as root make it the agent's own folder with: install -d -m 0700 -o <user> -g <group> <state.dir>`, whose command also sets the owner and mode of a folder that is there. `write_failed`: the agent could not write the pin, for example on a full disk, and left no partial file. |
+
+### Accepting a reviewer change
+
+When you change the first reviewer's name, address, format, model, proxy or CA file in `dispatch.yaml`
+(or reorder the reviewers so that another one is first), the agent refuses to start with
+`repair reviewer changed since it was pinned fields=<fields> pin=<path>`. To accept the change, after
+restarting the dispatcher (step 4):
+
+- **Host:** `sudo rm /var/lib/cairn-repair/state/reviewer-pin.json`, then start the agent.
+- **Compose:** remove it in the agent's volume, then start the agent:
+
+  ```bash
+  docker compose -f docker-compose.yaml -f docker-compose.repair.yaml run --rm --no-deps --entrypoint rm cairn-repair /var/lib/cairn-repair/state/reviewer-pin.json
+  docker compose -f docker-compose.yaml -f docker-compose.repair.yaml up -d cairn-repair
+  ```
+
+The next start pins the new reviewer and logs `repair reviewer pinned …`. A change you did not make
+means a worker or another process changed the reviewer: before you remove anything, look at the
+`repair:` section of `dispatch.yaml` and at the settings file, `agent-settings.json` in the copy root.
+`max_tokens`, `timeout_seconds`, `max_attempts`, `context_window`, `structured_output`, a reviewer's
+key and every other reviewer are not pinned: changing them never needs the pin removed.
+
+### Upgrading from an earlier Phase 2 build
+
+The agent now needs its state folder. On a host, create it (step 4 b's
+`sudo install -d -m 0700 -o cairn-repair -g cairn-repair /var/lib/cairn-repair/state`) before you
+start the new agent; without it, the agent stops with `repair reviewer pin unusable … reason=folder_missing`.
+In Compose, `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml up -d --build`
+creates the `cairn-repair-state` volume (a non-root agent needs its own folder first: Compose notes).
+The first start then logs `repair reviewer pinned …`. A
+reviewer that leaves `max_tokens` out now gets 16384 rather than 4096, or less with `context_window`
+(step 3). An earlier agent refuses the `state:` key of this build's `repair.yaml` as unknown: to go
+back to an earlier build, remove that key from `repair.yaml` first.
 
 ## 5. Switch on
 
@@ -571,7 +667,9 @@ root's contents, with `sudo`). A Phase 2 server started on that file again creat
   whose images are built as before.
 - **What the agent's container gets.** Read-only: `./repair.compose.yaml`, the agent token and the
   copy root. It mounts neither the Docker socket nor `dispatch.yaml`, and no key: the reviewers' keys
-  reach it in the settings file.
+  reach it in the settings file. Writable: its own named volume, `cairn-repair-state`, at
+  `/var/lib/cairn-repair/state`, where it pins its reviewer (step 4 f). The image creates that folder
+  root's, mode 0700, and a new volume takes that owner and mode.
 - **Order.** The agent refuses to start until the dispatcher has written its settings file.
   `depends_on` starts the dispatcher first, and `restart: unless-stopped` starts the agent again if it
   came up before the file was written.
@@ -587,6 +685,13 @@ root's contents, with `sudo`). A Phase 2 server started on that file again creat
   `./repair.compose.yaml` readable by it; and before the build make the agent's files readable by
   others in your checkout (`chmod -R a+rX repair-agent/pyproject.toml repair-agent/uv.lock
   repair-agent/src`), because the image keeps their mode bits and only removes write permission.
+  It also needs a state folder of its own, where it pins its reviewer: in your copy of the override,
+  replace the line of the `cairn-repair-state` volume with
+  `- ./datas/repair-state:/var/lib/cairn-repair/state`, and before the first `up` create that folder
+  for that user: `sudo install -d -m 0700 -o <uid> -g <gid> datas/repair-state`. The named volume
+  does not work for a non-root agent, even after a `chown`: whenever a container mounts it while it
+  is empty, as it is until the agent's first pin, Docker gives it the owner and mode of the image's
+  folder again, root's and 0700, so the agent would stop with `state_dir_owner`.
 - **A model server on the host.** Inside the agent's container, `127.0.0.1` is the container itself.
   A server on the host is reached as `http://host.docker.internal:<port>/v1`, the `REVIEW_BASE_URL` of
   its reviewer entry, which `extra_hosts` maps to the host's Docker bridge address (`docker0`,

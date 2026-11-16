@@ -36,6 +36,7 @@ repair-agent/
     cli.py         cairn-repair：--config、--once、--dry-run、--log-level、--allow-shared-user
     config.py      AgentConfig（repair.yaml）与 AgentSettings（设置文件），pydantic，extra="forbid"；秘密文件
     isolation.py   启动时的隔离检查
+    pin.py         评审模型固定（reviewer pin）：在线修复代理在启动时固定并核对第一个评审模型
     envguard.py    清理环境变量，设置各 logger 的级别
     server.py      RepairServerClient：list_runs、get_run、get_project、post_review
                    （自带 requests.Session，trust_env = False，不跟随重定向，不用代理）
@@ -70,7 +71,7 @@ cairn-repair --config PATH [--once] [--dry-run] [--log-level LEVEL] [--allow-sha
 | `--log-level` | 日志级别，默认 `INFO`。`urllib3` 的 logger 固定为 WARNING，因此 `--log-level DEBUG` 只显示修复代理自己的行 |
 | `--allow-shared-user` | 隔离检查失败也照常启动：每次启动都以 WARNING 记录 `repair agent running without isolation reasons=%s`，列出找到的原因（没有原因时为 `none`）。`repair.yaml` 与设置文件的启动错误不是“原因”，仍会让它停止 |
 
-每一种启动失败都以退出码 2 结束，并且发生在第一次轮询之前。启动错误（无效的 `repair.yaml`，缺失、不可读或无效的设置文件，模型名或 `context_window` 不满足规则）打印到标准错误，只给出字段，从不给出值。`SIGINT` 或 `SIGTERM` 停止轮询，并至多等待 15 s 让进行中的评审完成；第二个信号立即退出。信号到达时正在进行的那次轮询不再开始任何评审，它列出的窗口留给下一个修复代理。Compose 中 `cairn-repair` 的 `stop_grace_period` 为 20 s，长于这 15 s 的等待（Docker 默认 10 s 后即发送 SIGKILL）。
+每一种启动失败都以退出码 2 结束，并且发生在第一次轮询之前。启动错误（无效的 `repair.yaml`，缺失、不可读或无效的设置文件，模型名或 `context_window` 不满足规则）打印到标准错误，只给出字段，从不给出值；隔离检查与评审模型固定的拒绝以日志行记录（见「启动」）。在线修复代理每次启动都核对评审模型固定，带 `--dry-run` 或 `--once` 时也一样（dry run 仍会把 digest 发给评审模型）。`SIGINT` 或 `SIGTERM` 停止轮询，并至多等待 15 s 让进行中的评审完成；第二个信号立即退出。信号到达时正在进行的那次轮询不再开始任何评审，它列出的窗口留给下一个修复代理。Compose 中 `cairn-repair` 的 `stop_grace_period` 为 20 s，长于这 15 s 的等待（Docker 默认 10 s 后即发送 SIGKILL）。
 
 ---
 
@@ -101,6 +102,8 @@ transcripts:
   max_staleness_seconds: 45                          # 副本的最后一次检查（meta.checked_elapsed_seconds）可以比窗口打开的时刻早这么多
 digest:
   max_tokens_estimate: 8000                          # digest 预算；评审模型的 context_window 可以降低它
+state:
+  dir: "/var/lib/cairn-repair/state"                 # 修复代理自己的状态目录（cairn-repair，0700）：评审模型固定文件
 ```
 
 | 规则 | 检查（除注明外，不满足即为启动错误） |
@@ -115,7 +118,8 @@ digest:
 | `transcripts.root` | 已存在、且修复代理不能写入的目录；能写入时以原因 `copy_root_writable` 拒绝启动。它保存设置文件与副本，每个项目一个目录 |
 | `transcripts.max_bytes` | 副本的大小上限，默认 67108864（64 MiB，即 Dispatcher 的上限） |
 | `transcripts.max_staleness_seconds` | 默认 45；见「读取副本」的新鲜度检查 |
-| `digest.max_tokens_estimate` | digest 预算，默认 8000 |
+| `digest.max_tokens_estimate` | digest 预算，默认 8000；评审模型不写 `max_tokens` 时，其默认值也取决于它（见「评审模型设置」） |
+| `state.dir` | 可选，默认 `/var/lib/cairn-repair/state`：在线修复代理的状态目录，保存评审模型固定文件 `reviewer-pin.json`。与本文件的其他路径一样校验：相对路径或未替换的 `<…>` 占位符是启动错误。只有在线修复代理在启动时检查并使用它（见「启动」）；回放与门禁工具也读取本文件，但从不打开、查看或写入这个目录中的任何东西 |
 
 ### 设置文件 `agent-settings.json`
 
@@ -164,7 +168,7 @@ repair:
         # REVIEW_API_KEY: "<the reviewer's own key>"  # 可选（anthropic_messages 必填）；以 Authorization: Bearer <key> 发送（anthropic_messages：x-api-key）；写在这两行之间（运行手册第 3 步）
         REVIEW_BASE_URL: "http://127.0.0.1:11434/v1"  # 必填；追加 /chat/completions（anthropic_messages：/v1/messages）；Compose 中为 http://host.docker.internal:<port>/v1
       structured_output: true      # 只用于 openai_chat：发送 response_format json_schema；不支持它的服务端设为 false
-      max_tokens: 4096             # 为推理模型的思考加回答留出空间
+      max_tokens: 4096             # 为推理模型的思考加回答留出空间；不写时的默认值，这里因 context_window 为 16,384 而是 4096（没有 context_window 时为 16384，见下文「默认的 max_tokens」）
       context_window: 16384        # 服务端给模型的上下文（token），与服务端的设置相同，绝不能更大；决定 digest 预算与 room。默认 null，只适合不会截断 prompt 的服务端
       timeout_seconds: 180         # 每次尝试的时限；至多 max_attempts 次，都在模型截止时间之前
       max_attempts: 2
@@ -179,7 +183,7 @@ repair:
 | --- | --- | --- |
 | `api_format` | `openai_chat` | `openai_chat` 或 `anthropic_messages`；`anthropic_messages` 需要 `REVIEW_API_KEY` |
 | `structured_output` | true | 布尔值；false 不发送 `response_format`，用于不支持 JSON schema 的服务端。只用于 `openai_chat`：`anthropic_messages` 时必须不写、为 null 或 false |
-| `max_tokens` | 4096 | ≥ 1 的整数 |
+| `max_tokens` | 16384；设置了 `context_window` 时更低，不低于 4096（见下文「默认的 max_tokens」） | ≥ 1 的整数；设置了就按所写使用 |
 | `context_window` | null | null，或 ≥ 1 且留下至少 4,000 token digest 预算的整数（见下） |
 | `timeout_seconds` | 180 | ≥ 1 的整数；每次尝试的时限 |
 | `max_attempts` | 2 | ≥ 1 的整数 |
@@ -188,6 +192,16 @@ repair:
 | `price` | null | null，或恰好含 `input_per_mtok` 与 `output_per_mtok`，各为 ≥ 0 的有限数（每百万 token 的美元数）。只由回放与门禁报告读取，修复代理从不使用；只写在你自己的 `dispatch.yaml` 中 |
 
 `effort`、`server_fallbacks` 与 `provider` 已不存在：Dispatcher 把它们当作评审模型条目的未知键拒绝，修复代理也一样，因此为已删除的 Anthropic 客户端写的配置块不会悄悄地什么也不做。`REVIEW_MODEL` 与 `REVIEW_BASE_URL` 必填；`REVIEW_API_KEY` 对 `openai_chat` 可选，对 `anthropic_messages` 必填。
+
+**默认的 `max_tokens`**（所有者决定 O10）：推理模型在 `max_tokens` 之内先思考，再写 JSON 回答；上限是 4096 时，它常在回答之前就停止，评审因此成为 `invalid_output`（原因 `max_tokens`）。`max_tokens` 是上限，不是目标：服务商按实际生成的 token 计费。设置文件中不写 `max_tokens`（`dispatch.yaml` 不写它时，Dispatcher 写出的条目也不含这个键）或其为 null 的评审模型：
+
+- 没有 `context_window`（托管 API）时为 16384（`DEFAULT_MAX_TOKENS`）。
+- 设置了 `context_window`（本地模型服务）时，默认值绝不能改变今天发给它的 digest：每个 digest 的 UTF-8 字节数不超过 room（`context_window − system_est − max_tokens`，见下文「digest 预算」），任何大于 4096 的 `max_tokens` 都会缩小 room。因此默认值为 `min(16384, max(4096, context_window − system_est − max(K × digest.max_tokens_estimate, 4000)))`，其中 K = 4：按 §9.6 的估计，一个 digest 每个估计的 token 至多含 4 个 UTF-8 字节（ASCII 字符每 3 个算一个 token、共 3 个字节，其他字符各算一个 token、至多 4 个字节；预算覆盖整个 digest：头部、带换行的每一行、结束标签与截断说明），因此预算之内的 digest 至多 K × 预算个字节。默认值只在 room 仍不小于 K × 预算时才高于 4096，此时 room 从不起作用，digest 与 `max_tokens` 为 4096 时逐字节相同；否则就是 4096。room 同时不小于 `MIN_DIGEST_TOKENS`（4000），因此 room 检查拒绝的上下文与 4096 时完全相同（预算低于 1,000 时也是如此）。默认预算 8,000 时，`context_window` 不超过 37,334 时默认值为 4096，从 37,335 起逐渐升高，从 49,622 起为 16384；例如 16,384 与 32,768 为 4096，40,000 为 6,762，65,536 为 16384。
+- 设置了的 `max_tokens` 按所写使用，规则检查与以前相同。
+
+每个评审模型只有一个解析后的值，在设置文件与 `repair.yaml` 的 digest 预算都已知的地方（读取设置文件时）计算一次，用于修复代理与工具中用到 `max_tokens` 的每一处：两种格式的请求体、room 与 digest 预算、回放的计划行。回放与门禁读取同一个 `repair.yaml`，因此得到同一个值。回放以 `--digest-tokens` 比较的其他预算是例外：对每个这样的预算，不写 `max_tokens` 的评审模型得到在线修复代理在 `repair.yaml` 中设置了该预算时会解析出的值（同一个规则函数，`replay.reviewer_at`），用于该预算的 room、digest、请求与计划行，因此每个比较都是在线修复代理以该预算会做的事，默认值也就不会改变它的 digest；设置了的 `max_tokens` 在每个预算都按所写使用。例如 `context_window` 为 65,536 时，8,000 的预算得到 16384（room 47,914 字节），24,000 的预算得到 4096（room 60,202 字节，而不是 16384 留下的 47,914）。
+
+有些模型允许的输出 token 少于 16384（有些非推理模型只允许 4096 或 8192），未设置 `context_window` 的服务端上下文也可能很小：这样的服务商对每个请求都以 HTTP 400（有的以 422）回答，而旧的默认值可以用。重试与错误映射不变：4xx 仍是 `model_error`，不重试。但 `max_tokens` 来自默认值的请求得到 400 或 422 时，每个进程对每个评审模型以 WARNING 记录一次 `repair model refused a request with the default max_tokens, set max_tokens if the model allows fewer reviewer=%s max_tokens=%s status=%s`，从不读取或记录响应体。设置了 `max_tokens`，或其他任何状态，都没有这一行。此时把该评审模型的 `max_tokens` 设为其模型的上限。`max_tokens` 不在评审模型固定之内，修改它从不需要删除固定文件。
 
 **模型名**：没有默认模型。启动时拒绝为空、超过 100 个字符（服务端对 `model` 的上限，否则每次评审都会得到最终的 422），或含有空白、`<`、`>` 的名称，信息为 `reviewer <name>: set REVIEW_MODEL in the repair: section of dispatch.yaml to the model your provider serves, at most 100 characters; serve a longer name under a shorter one, for example with vLLM's --served-model-name`。
 
@@ -207,18 +221,28 @@ repair:
    - `copy_root_writable`：`os.access(transcripts.root, os.W_OK, effective_ids=True)` 为真。Compose 以只读方式挂载副本根目录，在宿主机上修复代理的用户只有该目录的组读权限；
    - `worker_credentials_readable`：在 `transcripts.root` 所有者的家目录（`pwd.getpwuid(owner_uid).pw_dir`；该 uid 没有条目时跳过）中，Dispatcher 在 local 模式下脱敏的某个 CLI 凭据文件，在其默认位置能以读方式打开：`.claude/.credentials.json`、`.claude/settings.json`、`.claude.json`、`.codex/auth.json`、`.codex/config.toml`、`.pi/agent/auth.json` 或 `.pi/agent/models.json`。local 模式下保存 Worker key 的是这些文件，而不是 `dispatch.yaml`。用 `CLAUDE_CONFIG_DIR`、`CODEX_HOME` 或 `PI_CODING_AGENT_DIR` 移走的文件（设置了 `CLAUDE_CONFIG_DIR` 时 `.claude.json` 也在该目录中），应逐个列在 `isolation.unreadable_paths` 中，而不是列出其目录（打开目录只测试目录自己的读权限位）；每个变量下的文件见「宿主机安装：以自己的用户运行」第 d 步；
    - `readable:<path>`：`isolation.unreadable_paths` 中的某个路径能以读方式打开；
-   - `config_writable`、`secret_writable`、`package_writable`、`settings_writable`：下面的所有权检查对 `repair.yaml` 或某个已配置的 CA 文件、某个已配置的秘密文件、修复代理的代码，或设置文件不通过。
+   - `config_writable`、`secret_writable`、`package_writable`、`settings_writable`：下面的所有权检查对 `repair.yaml` 或某个已配置的 CA 文件、某个已配置的秘密文件、修复代理的代码，或设置文件不通过；
+   - `state_dir_symlink`、`state_dir_owner`、`state_dir_writable`：状态目录（`state.dir`）是符号链接（`os.lstat`），不属于修复代理的有效 uid，或组与其他用户可写（`st_mode & 0o022`；后两项检查符号链接所指的目录）。能替换这个目录或在其中写入的其他用户（或 local Worker）就能替换评审模型固定文件。这三个原因只在在线修复代理启动时（`cli.start`）检查；回放与门禁工具既不检查、也不读写 `state.dir` 下的任何东西。目录不存在不是原因，而是第 5 步评审模型固定的启动错误：没有它就无法固定，`--allow-shared-user` 也不改变这一点；目录属于修复代理、模式却不给其用户读、搜索与写权限（缺少 u+rwx）也不是原因，同样在第 5 步停止。
 
    “能以读方式打开”指 `os.open(path, os.O_RDONLY | os.O_NONBLOCK)` 成功；描述符立即关闭，不读取任何内容。
 
    **所有权检查**：local Worker 以你的用户运行。你能修改的修复代理配置、秘密或代码，会让它关掉隔离检查自己的测试（修改 `dispatch_config_to_check`、`isolation.unreadable_paths` 或 `transcripts.root`）、读取或替换修复代理的令牌，或以修复代理的用户执行代码。因此以下各项都必须属于 uid 0 或修复代理的有效 uid，且组与其他用户都不可写（`st_mode & 0o022 == 0`）：`repair.yaml`，以及 `server_ca_bundle` 与各评审模型的 `ca_bundle` 指向的 CA 文件（设置了时；`config_writable`）；`token_file` 与 `server_api_key_file`（`secret_writable`）；导入 `cairn_repair_agent` 包的目录（`os.path.dirname(cairn_repair_agent.__file__)`），以及解释器的 `purelib` 与 `platlib` 目录（`sysconfig.get_paths()`，保存其依赖）（`package_writable`）。设置文件按设计属于 Dispatcher 的用户，因此有它自己的检查：必须属于 uid 0 或 `transcripts.root` 的所有者，且组与其他用户都不可写（`settings_writable`）。位于只读挂载上的路径（`os.statvfs(path).f_flag & os.ST_RDONLY`）不检查：Compose 以只读方式绑定配置与秘密（它们是你的用户的文件），副本根目录与其中的设置文件也是只读的。
 
-   **隔离检查不再保护的内容**：评审模型的地址与 key、服务端地址与 `projects` 列表现在在 `dispatch.yaml` 与设置文件中，属于 Dispatcher 的用户。local 模式下你的 local Worker 以这个用户运行，因此它们能读取每个评审模型的 key、扩大 `projects`，并把评审模型指向它们自己的监听端口，由后者接收 digest 并决定评审结论；它们也能把 `server` 指向自己的监听端口，由后者接收 agent 令牌（它们本来就能在服务端的令牌文件中读到）以及提交的 digest 与原始输出，并能交给修复代理它们挑选的运行。Phase 2 什么也不执行，因此接受这一点：修复代理在宿主机上每次启动时都说明这一点（第 5 步），评审模型的设置必须在 Phase 3 执行任何决定之前得到保护。
+   **隔离检查不再保护的内容**：评审模型的地址与 key、服务端地址与 `projects` 列表现在在 `dispatch.yaml` 与设置文件中，属于 Dispatcher 的用户。local 模式下你的 local Worker 以这个用户运行，因此它们能读取每个评审模型的 key、扩大 `projects`，并把评审模型指向它们自己的监听端口，由后者接收 digest 并决定评审结论；它们也能把 `server` 指向自己的监听端口，由后者接收 agent 令牌（它们本来就能在服务端的令牌文件中读到）以及提交的 digest 与原始输出，并能交给修复代理它们挑选的运行。Phase 2 什么也不执行，因此接受这一点：修复代理在宿主机上每次启动时都说明这一点（第 5 步），评审模型的设置必须在 Phase 3 执行任何决定之前得到保护。第 5 步的评审模型固定（所有者决定 O9）是为此先加的一道简单保护：把第一个评审模型指向别处会让修复代理停止，而不是改变 digest 的去向；它不保护 `server`。
 
    **`--allow-shared-user`** 把每个原因都变为警告：修复代理每次启动都以 WARNING 记录 `repair agent running without isolation reasons=%s`（找到的原因，没有时为 `none`），然后启动。支持的部署是 Compose（修复代理以 root 运行在自己的容器中，容器不挂载 Docker socket 与 `dispatch.yaml`，以只读方式挂载副本根目录、它的配置与秘密）与宿主机安装（专用的操作系统用户，只有副本根目录的组读权限，其代码、配置与令牌只有 root 或该用户能修改；它的评审模型设置来自 Dispatcher）。在宿主机上，以 root 或 Dispatcher 的用户运行的修复代理会被拒绝。
 3. **环境保护**：读取 `token_env`（若配置了）之后、构建任何客户端（包括服务端客户端）之前，从 `os.environ` 中删除（不区分大小写）`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`、`SSL_CERT_FILE`、`SSL_CERT_DIR`、`REQUESTS_CA_BUNDLE`、`CURL_CA_BUNDLE`、`NETRC` 与 `SSLKEYLOGFILE`，只在一行中记录排序后的名称（`repair agent ignored environment variables names=%s`），从不记录值。设置了任一代理变量时，默认的 `requests.Session` 会把 digest、key 与 agent 令牌发往它们指定的代理（`http://` 端点时还是明文），而 local 模式的示例配置建议在启动 Dispatcher 的 shell 中导出 `http_proxy`、`https_proxy` 与 `all_proxy`。`SSLKEYLOGFILE` 也要删除，因为无论 `trust_env` 如何，`ssl` 与 `urllib3` 都会读取它，并把 TLS 会话密钥写进那个文件。代理与 CA 文件只来自 `repair.yaml` 与设置文件。`ANTHROPIC_*` 与 `CLAUDE_*` 变量不被删除：它们不会到达任何请求，`anthropic_messages` 调用的地址与 key 只取自设置文件。
 4. 把 `urllib3` 的 logger 设为 WARNING。修复代理不导入任何模型 SDK：它的模型客户端是一个 `requests.Session`。
 5. **谁能修改评审模型设置**：设置文件不属于 uid 0 时，记录一次 `repair reviewer settings are writable by the dispatcher's user, local workers can change them path=%s`（WARNING），然后继续。修复代理看不到 Dispatcher 的执行模式，因此按文件的所有者判断：在宿主机上 Dispatcher 以你的用户运行，这一行会被记录（local 与 container 模式都是）；在 Compose 中 Dispatcher 以 root 运行，不会记录。设置文件对其他用户可读（`mode & 0o004`）时，再记录一次 `repair agent settings file readable by others path=%s mode=%s`（mode 为八进制），然后继续：它保存着评审模型的 key。副本根目录所属组的读权限是预期的，因为那个组就是修复代理的组。
+
+   然后，在这些 WARNING（它们说明谁能修改评审模型）之后、构建任何 HTTP 客户端（包括服务端客户端）与发送任何请求之前，核对**评审模型固定**（reviewer pin，所有者决定 O9）：
+   - **固定什么**：在线修复代理使用的评审模型（设置文件中的第一个）经校验之后的 `name`、`base_url`、`api_format`、`model`、`proxy` 与 `ca_bundle`（各为字符串或 null）。从不固定 key，也不固定 `max_tokens`、`context_window`、`timeout_seconds`、`max_attempts` 或 `structured_output`：它们都不能改变 digest 的去向。把另一个评审模型排到第一位也是变更（其字段不同）。
+   - **固定文件** `<state.dir>/reviewer-pin.json`：`{"version": 1, "pinned_at": "<UTC 时间，ISO 8601，精确到秒>", "reviewer": {"name": …, "base_url": …, "api_format": …, "model": …, "proxy": …, "ca_bundle": …}}`，值与修复代理读到的相同。原子地写入：在 `state.dir` 中以 `O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW`、模式 0600 创建临时文件，写入，`fsync`，`os.replace` 为 `reviewer-pin.json`，再 `fsync` 该目录；任何失败都删除临时文件。读取时以 `os.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)` 打开，用 `fstat` 检查（普通文件、所有者、模式、大小），至多读取 64 KiB + 1 字节，在一个保护中解析一次。文件中的值与设置文件一样私密：它是修复代理自己用户的 0700 目录中的 0600 文件。
+   - **没有固定文件**：写入它，记录 INFO `repair reviewer pinned reviewer=%s endpoint=%s`（评审模型的名称，以及与启动行的 `endpoint=` 相同的 `scheme://host:port`，从不记录更多的 URL），然后继续。
+   - **固定文件与六个字段都相同**：继续，不记录额外的行。
+   - **不同**：以退出码 2 拒绝启动，记录一行 ERROR `repair reviewer changed since it was pinned fields=%s pin=%s`，`fields` 按上面的顺序以逗号列出变化的字段，`pin` 为固定文件的路径；再记录一行给出补救办法：`repair reviewer pin: if you changed the reviewer yourself, remove the pin file as root and start the agent again`。从不记录字段的旧值或新值。
+   - **无法使用的固定文件**以退出码 2 停止，记录一行 `repair reviewer pin unusable path=%s reason=%s`（与上面相同的补救行随后），从不打印 traceback。原因：`folder_missing`（目录不存在；这一行还给出以 root 运行、创建该目录的命令 `install -d -m 0700 -o <user> -g <group> <state.dir>`，用户与组取自 `pwd`/`grp`，此时没有补救行）；`not_a_regular_file`（符号链接，`O_NOFOLLOW` 的打开以 `ELOOP` 拒绝它，或 `fstat` 显示不是普通文件，例如 FIFO 或目录）；`owner_or_mode`（文件不属于修复代理的有效 uid，或组与其他用户可写）；`too_large`（超过 64 KiB，读取之前在打开的描述符上检查，读取本身也有上限）；`malformed`（不是 UTF-8 或不是 JSON（捕获 `ValueError` 与 `RecursionError`），或不是上面恰好的形状：未知或缺少的键、错误的类型）；`wrong_version`（`version` 不是 1）；`unreadable:<errno 名称>`（其他任何 `OSError`，只给出 errno 的名称）。状态目录存在、却不是修复代理能使用的目录时（例如属于另一个用户的 0700 目录，`unreadable:EACCES`；`state.dir` 指向一个文件，`unreadable:ENOTDIR`；修复代理自己的目录，模式却不给其用户读、搜索与写权限（缺少 u+rwx，例如 0600：能列出却不能在其中打开固定文件；0500：能读取却不能写入固定文件），`unreadable:EACCES`，即没有这些权限的用户得到的错误，在读取或写入固定文件之前按 `fstat` 的模式检查，修复代理以 root 运行时也一样），问题在目录而不在固定文件（它可能并不存在），随后的一行改为该目录的补救办法：`repair reviewer pin: the agent cannot use its state folder; check state.dir in repair.yaml, and as root make it the agent's own folder with: install -d -m 0700 -o <user> -g <group> <state.dir>`（对已有的目录，`install -d` 设置其所有者与模式）。写入失败也以退出码 2 停止：`repair reviewer pin unusable path=%s reason=write_failed`，不留下临时文件，也没有补救行。
+   - **局限**：固定能阻止 Worker 改变在线修复代理的评审模型的去向；它不阻止 Worker 读取 `dispatch.yaml` 或设置文件中评审模型的 key，也不阻止它修改其他设置，包括 `server`：修复代理把 agent 令牌以及它提交的每个 digest 与原始输出发往这个 Cairn 地址，把它指向自己监听端口的 Worker 就会收到它们；你的用户能不输密码运行 `sudo` 时它也不成立，因为那样 Worker 可以自己删除固定文件。只有在线修复代理固定评审模型（带不带 `--dry-run`、`--once` 都一样）；回放（`replay_eval_set.py`）、门禁报告（`gate_report.py`）与 `tools/repair-phase2/` 下的每个工具都从不固定，也从不核对固定文件，而回放把评估集的 digest 发给设置文件中的每个评审模型。因此带 `--yes` 运行回放之前，先查看它读取的设置文件（副本根目录中的 `agent-settings.json`）中每个评审模型的 `base_url`、`proxy` 与 `ca_bundle`。
 6. 记录 `repair agent started server=%s reviewer=%s model=%s endpoint=%s digest_tokens=%s poll=%ss projects=%s transcripts=%s dry_run=%s`：第一个评审模型的名称、其 `model`、其 `endpoint`（`base_url` 的 `scheme://host:port`）与 digest 预算；`projects` 为列出的项目数，设置文件的 `projects` 为 null 时为 `all`。
 7. 进入循环。
 
@@ -421,7 +445,7 @@ LATEST AGENT MESSAGES (oldest first):
 ```json
 {"model": "<model>",
  "messages": [{"role": "system", "content": "<SYSTEM_PROMPT>"}, {"role": "user", "content": "<digest text>"}],
- "max_tokens": 4096,
+ "max_tokens": 16384,
  "stream": false,
  "response_format": {"type": "json_schema",
                      "json_schema": {"name": "repair_decision", "strict": true, "schema": "<DECISION_SCHEMA>"}}}
@@ -432,7 +456,7 @@ LATEST AGENT MESSAGES (oldest first):
 **`anthropic_messages`**：`POST {base_url}/v1/messages`，`base_url` 不带 `/v1`（`https://api.anthropic.com`，与 Claude Code 的 `ANTHROPIC_BASE_URL` 写法相同）；请求头为 `x-api-key: <api_key>`、`anthropic-version: 2023-06-01`、`Content-Type: application/json`，以及与其他格式相同的 `Accept-Encoding: identity`：
 
 ```json
-{"model": "<model>", "max_tokens": 4096, "system": "<SYSTEM_PROMPT>",
+{"model": "<model>", "max_tokens": 16384, "system": "<SYSTEM_PROMPT>",
  "messages": [{"role": "user", "content": "<digest text>"}]}
 ```
 
@@ -460,7 +484,7 @@ LATEST AGENT MESSAGES (oldest first):
 
 - `timeout_seconds` 是每次尝试的时限，而不是每次评审的。每次尝试的时限为 `min(timeout_seconds, 距模型截止时间的剩余时间)`，连接 5 s。剩余至少 10 s 时才做第二次尝试。至多 `max_attempts` 次（默认 2），每次都在模型截止时间（`accept_until − 10 s`）之前开始。重试：超时、连接错误、429、5xx；不重试：其他任何 4xx。客户端自己不做任何重试，因此只由修复代理决定还来得及做什么。
 - 在窗口打开后一个轮询周期之内开始的评审，距模型截止时间至少有 `(B − 20) − floor(0.75 × B) − poll_interval` 秒（预算为 B 秒）：`poll_interval` 为 5 时，B = 1800 有 425 s（两次默认的 180 s 尝试），B = 600 有 125 s（一次 125 s 的尝试），最小可评审的 350 s 窗口有 63 s（一次 63 s 的尝试）。回放给每个用例同样的时间。
-- `max_tokens`（默认 4096）为推理模型的思考加 JSON 回答留出空间。达到它的回答（`finish_reason` 为 `length`；`anthropic_messages` 为 `stop_reason` 为 `max_tokens`）是 `invalid_output`，原因 `max_tokens`，在报告中单独计数。Messages API 中思考也计入 `max_tokens`，在 `max_tokens` 处被截断的回答会在任何文本之前停止；因此若回放对一个默认会思考的模型统计到 `max_tokens` 停止，在一次尝试的时间允许的范围内提高其 `max_tokens`。
+- `max_tokens`（不写时默认 16384，设置了 `context_window` 时更低，见「评审模型设置」中的「默认的 max_tokens」；两种格式的请求都带解析后的值）为推理模型的思考加 JSON 回答留出空间。达到它的回答（`finish_reason` 为 `length`；`anthropic_messages` 为 `stop_reason` 为 `max_tokens`）是 `invalid_output`，原因 `max_tokens`，在报告中单独计数。Messages API 中思考也计入 `max_tokens`，在 `max_tokens` 处被截断的回答会在任何文本之前停止；因此若回放对一个默认会思考的模型统计到 `max_tokens` 停止，在一次尝试的时间允许的范围内提高其 `max_tokens`。
 - 不发送任何采样参数或推理设置（`anthropic_messages` 没有 `thinking`，也没有 `output_config`）：推理模型按其服务端的配置在 `max_tokens` 之内推理，默认开启思考的 Claude 模型按 API 的默认设置思考。
 - 模型客户端抛出的、上述规则没有提到的任何异常（例如解码嵌套很深的响应体时的 `RecursionError`），都是 `model_error`，附异常的类名，不重试；它永远不会结束评审线程或修复代理。
 - **（未验证）** 每个 `openai_chat` 评审模型的服务端是否接受带 `json_schema` 的 `response_format`：拒绝它的服务端以 4xx 回答，每次评审都会是 `model_error`；忽略它的服务端，其回答仍然要经过校验。对这样的服务端设置 `structured_output: false`。回放带 `--yes` 的单用例运行会在完整运行之前为每个评审模型确定这一点。
@@ -591,8 +615,14 @@ logger 为 `cairn_repair_agent.*`。这是完整的列表：修复代理记录�
 | 级别 | 日志行 |
 | --- | --- |
 | INFO | `repair agent started server=%s reviewer=%s model=%s endpoint=%s digest_tokens=%s poll=%ss projects=%s transcripts=%s dry_run=%s`（第一个评审模型的名称、`model`、`endpoint`（`base_url` 的 `scheme://host:port`）与 digest 预算；`projects` 为数量或 `all`） |
-| ERROR | `repair agent isolation check failed reasons=%s`（隔离检查的原因，以逗号分隔：`docker_socket`、`docker_host`、`dispatch_config_readable`、`dispatch_config_missing`、`same_user`、`copy_root_writable`、`worker_credentials_readable`、`readable:<path>`、`config_writable`、`secret_writable`、`package_writable`、`settings_writable`） |
+| ERROR | `repair agent isolation check failed reasons=%s`（隔离检查的原因，以逗号分隔：`docker_socket`、`docker_host`、`dispatch_config_readable`、`dispatch_config_missing`、`same_user`、`copy_root_writable`、`worker_credentials_readable`、`readable:<path>`、`config_writable`、`secret_writable`、`package_writable`、`settings_writable`、`state_dir_symlink`、`state_dir_owner`、`state_dir_writable`） |
 | WARNING | `repair agent running without isolation reasons=%s`（同样的原因，没有原因时为 `none`；带 `--allow-shared-user` 时每次启动都记录） |
+| INFO | `repair reviewer pinned reviewer=%s endpoint=%s`（第一次启动写入评审模型固定文件时；`endpoint` 为 `scheme://host:port`） |
+| ERROR | `repair reviewer changed since it was pinned fields=%s pin=%s`（只有字段名，从不给出值；随后是补救行） |
+| ERROR | `repair reviewer pin unusable path=%s reason=%s`（`not_a_regular_file`、`owner_or_mode`、`too_large`、`malformed`、`wrong_version`、`unreadable:<errno>`，随后是补救行，状态目录本身不能使用时是目录的补救行；以及没有补救行的 `write_failed`） |
+| ERROR | `repair reviewer pin unusable path=%s reason=folder_missing; as root, create the folder with: install -d -m 0700 -o %s -g %s %s` |
+| ERROR | `repair reviewer pin: if you changed the reviewer yourself, remove the pin file as root and start the agent again`（补救行） |
+| ERROR | `repair reviewer pin: the agent cannot use its state folder; check state.dir in repair.yaml, and as root make it the agent's own folder with: install -d -m 0700 -o %s -g %s %s`（状态目录存在却不是修复代理能使用的目录时的补救行：打不开，或属于修复代理却缺少 u+rwx） |
 | WARNING | `repair agent ignored environment variables names=%s`（只有名称，排序：环境保护删除的代理、CA、netrc 与密钥日志变量） |
 | WARNING | `repair agent token file readable by others file=%s mode=%s`（启动时一次） |
 | WARNING | `repair reviewer settings are writable by the dispatcher's user, local workers can change them path=%s`（启动时一次，设置文件不属于 root 时） |
@@ -605,6 +635,7 @@ logger 为 `cairn_repair_agent.*`。这是完整的列表：修复代理记录�
 | INFO | `repair digest built run=%s tokens_est=%s tool_calls=%s running=%s redactions=%s shrunk=%s build_ms=%s` |
 | INFO | `repair model call run=%s reviewer=%s model=%s attempt=%s outcome=%s stop=%s input_tokens=%s prompt_est=%s output_tokens=%s ms=%s request_id=%s`，每次尝试一行。`reviewer` 为评审模型的名称。`outcome` 为 `ok`、`timeout`、`connection_error`、`status_<code>`、`refusal`、`bad_response`、`context_truncated` 或 `error_<exception class>`。`model` 为提交的值。`request_id` 为响应的 `x-request-id` 响应头（`anthropic_messages` 为 Claude API 发送的 `request-id`，没有时为 `x-request-id`），存在且被 `re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", …)` 接受时记录，否则为 `-`。`stop` 为 `finish_reason`（`anthropic_messages` 为 `stop_reason`），是被 `re.fullmatch(r"[a-z_]{1,32}", …)` 接受的字符串时记录，其他字符串或值为 `other`，没有响应或字段缺失、为 null 时为 `-`。`input_tokens` 与 `output_tokens` 为响应的 `usage.prompt_tokens` 与 `usage.completion_tokens`（各自是 token 数时），否则为 `-`；`anthropic_messages` 为 `usage.input_tokens`（是 token 数时）加上存在的 `usage.cache_creation_input_tokens` 与 `usage.cache_read_input_tokens`，以及 `usage.output_tokens`。`prompt_est` 为修复代理对系统 prompt 加 digest 的估计 |
 | WARNING | `repair model usage missing, a cut prompt cannot be detected endpoint=%s`（每个进程每个端点一次） |
+| WARNING | `repair model refused a request with the default max_tokens, set max_tokens if the model allows fewer reviewer=%s max_tokens=%s status=%s`（`max_tokens` 来自默认值的请求得到 400 或 422 时，每个进程每个评审模型一次） |
 | INFO | `repair review posted run=%s window=%s decision=%s fallback=%s status=%s truncated=%s` |
 | INFO | `repair review refused run=%s window=%s code=%s` |
 | ERROR | `repair agent token rejected status=%s` |
@@ -624,7 +655,7 @@ Phase 3 只有在修复代理的影子结论与你对 proj_027 超时 Intent 的
 `tools/repair-phase2/` 中：
 
 - `redact_eval_set.py` 在 `cairn` 环境中运行，因为它与 Dispatcher 完全一样地读取 `dispatch.yaml`；
-- `replay_eval_set.py`、`gate_report.py` 与 `export_shadow_runs.py` 在修复代理的环境中运行；`replay_eval_set.py` 调用与在线修复代理相同的 `transcripts`、`digest`、`model` 与 `decision` 代码。它从同一个设置文件读取评审模型：`--config` 指定修复代理的 `repair.yaml`，其 `transcripts.root` 中有 `agent-settings.json`。因此 Dispatcher 必须带着 `repair:` 部分启动过一次，而评审模型的 key 只在 `dispatch.yaml` 中填写。
+- `replay_eval_set.py`、`gate_report.py` 与 `export_shadow_runs.py` 在修复代理的环境中运行；`replay_eval_set.py` 调用与在线修复代理相同的 `transcripts`、`digest`、`model` 与 `decision` 代码。它从同一个设置文件读取评审模型：`--config` 指定修复代理的 `repair.yaml`，其 `transcripts.root` 中有 `agent-settings.json`。因此 Dispatcher 必须带着 `repair:` 部分启动过一次，而评审模型的 key 只在 `dispatch.yaml` 中填写。它用同一个 `repair.yaml` 的 digest 预算解析每个评审模型的 `max_tokens`，因此与在线修复代理得到同一个值；`--digest-tokens` 中的其他预算各用在线修复代理以该预算会解析出的值（见「评审模型设置」中的「默认的 `max_tokens`」）。这些工具都不固定评审模型：它们从不打开、查看或写入 `state.dir` 下的任何东西。
 
 **评审模型**：回放按 `dispatch.yaml` 中的顺序，在相同的用例上运行设置文件中的每个评审模型：相同的会话记录、截断点、上下文与 digest，只是设置了 `context_window` 的评审模型得到以它自己的预算与 room 构建的 digest，构建方式与在线修复代理为它构建 digest 时相同（见「评审模型设置」中的「digest 预算」）：`context_window` 降低了预算时以那个预算构建，并且每个 digest 的 UTF-8 字节数不超过它的 room，因此即使预算与另一个评审模型的相同，它的 digest 也可能不同（例如 16,384 的上下文保持 8,000 的预算，而 room 会缩减较大的 digest）。可重复的 `--reviewer NAME` 只运行指定的评审模型；未知的名称在任何调用之前以退出码 3 结束。每个评审模型的记录分别按标准评分，你保留第一个通过的评审模型：把本地评审模型列在最前面，它通过就会被保留。
 
@@ -664,7 +695,7 @@ uv run --project repair-agent python tools/repair-phase2/gate_report.py --labels
 5. **上下文**：窗口 1，已用 `0.75 × 预算`，时间片 0，`slice_seconds` 600（或 `--slice-seconds`），副本年龄 0；Intent 与来源来自 `intent.json`；来源 Fact 与新 Fact 来自 `--project-json`（在 `(t0, cut]` 之间结论的 Intent 的 Fact）。
 6. **评审**：对每个评审模型做 digest、模型调用与校验。模型调用得到的时间与预算为 B 的运行在窗口打开时的在线评审相同：`seconds_left = (B − 20) − floor(0.75 × B) − poll_interval`，`poll_interval` 取自 `--config`（poll 为 5 时 B = 1800 为 425 s，B = 600 为 125 s）。每次尝试的时限为 `min(timeout_seconds, 剩余时间)`，使用评审模型的 `timeout_seconds` 与 `max_attempts`，重试规则与在线完全相同，因此门禁测量的正是在线评审所用的时钟。每个评审模型、用例与重复向 `decisions.jsonl` 写一行 JSON：`reviewer, intent_id, repetition, transcript, transcript_sha256, cli, budget_seconds, cut_seconds, seconds_left, digest_budget, digest_tokens_estimate, prompt_tokens_estimate, digest_sha256, decision, fallback, reason, evidence, next_step, cited, model, input_tokens, output_tokens, ms, finish_reason, cost_usd`。`digest_budget` 是构建该 digest 所用的预算，`prompt_tokens_estimate` 即日志中的 `prompt_est`。`input_tokens`、`output_tokens` 与 `finish_reason` 是最后一次尝试的 `repair model call` 一行中的 `input_tokens`、`output_tokens` 与 `stop`，其 `-` 写为 null，因此 `anthropic_messages` 评审模型的 `finish_reason` 保存其 `stop_reason`。`cost_usd` 是按评审模型的 `price` 计算的 `input_tokens` 与 `output_tokens` 的费用，没有 `price` 或任一计数为 null 时为 null。`ms` 是整个模型调用的耗时，从第一次尝试开始到最后一次尝试结束，包括每次尝试及其间的等待，因此第一次尝试超时、重试才成功的评审不会被记成快的评审；没有任何尝试时为 null。digest 写到 `<out>/digests/<reviewer>/`；它们含有目标数据，因此该目录与 Phase 0 的评估集一样只留在本地。每次尝试都把修复代理的 `repair model call` 一行打印到标准错误。
 
-   在任何调用之前、构建完所有 digest 之后，工具为每个评审模型打印一行 `planned reviewer=%s calls=%s max_input_tokens=%s max_output_tokens=%s ceiling=%s`：调用次数、这些调用的 `prompt_tokens_estimate` 之和、调用次数 × 其 `max_tokens`，以及有 `price` 时的上限 `$%.2f` = (`max_input_tokens` × `input_per_mtok` + `max_output_tokens` × `output_per_mtok`) / 1,000,000，没有时为 `no_price`。然后，除非给出 `--yes`，否则停止。上限按每次调用一次计费尝试计算，重试的尝试可能使费用更高。
+   在任何调用之前、构建完所有 digest 之后，工具为每个评审模型打印一行 `planned reviewer=%s calls=%s max_input_tokens=%s max_output_tokens=%s ceiling=%s`：调用次数、这些调用的 `prompt_tokens_estimate` 之和、这些调用的 `max_tokens`（解析后的值；`--digest-tokens` 的每个预算用它自己的值）之和，以及有 `price` 时的上限 `$%.2f` = (`max_input_tokens` × `input_per_mtok` + `max_output_tokens` × `output_per_mtok`) / 1,000,000，没有时为 `no_price`。然后，除非给出 `--yes`，否则停止。上限按每次调用一次计费尝试计算，重试的尝试可能使费用更高。
 
 ### 注入探测
 
@@ -755,13 +786,18 @@ services:
       - ./repair.compose.yaml:/repair-agent/repair.yaml:ro
       - ./secrets/repair-agent.token:/run/secrets/repair-agent.token:ro
       - ./datas/repair-transcripts:/var/lib/cairn-repair/transcripts:ro
+      - cairn-repair-state:/var/lib/cairn-repair/state   # 修复代理自己的状态目录：评审模型固定文件
     command: ["cairn-repair", "--config", "/repair-agent/repair.yaml"]
+
+volumes:
+  cairn-repair-state:                         # 从镜像中的目录创建：属于 root，0700
 ```
 
+- **状态目录**：修复代理的 `Dockerfile` 以 `install -d -m 0700 /var/lib/cairn-repair/state` 创建该目录（属于 root，因为容器中的修复代理以 root 运行）；新的命名卷取镜像中该目录的所有者与模式，因此 `cairn-repair-state` 卷属于 root、模式 0700，`repair.compose.example.yaml` 的 `state.dir` 指向它。以非 root 运行的修复代理改用自己的目录（见下面的「用户」）。
 - Dispatcher 的修复设置与评审模型是 `./dispatch.yaml` 的 `repair:` 部分，`docker-compose.yaml` 已经把它挂载在 `/cairn/dispatch.yaml`。因此覆盖文件不给 Dispatcher 任何修复文件或环境变量，也不给修复代理任何 key：修复代理从它以只读方式挂载的副本根目录中的设置文件 `agent-settings.json` 读取评审模型。
 - 修复代理的容器既不挂载 `docker.sock`，也不挂载 `dispatch.yaml`。
 - **顺序**：Dispatcher 写入设置文件之前，修复代理拒绝启动。`depends_on` 先启动 Dispatcher，若修复代理在文件写入之前启动了，`restart: unless-stopped` 会再次启动它。
-- **用户**：修复代理在其容器内以 root 运行（镜像没有 `USER` 行，与今天的镜像相同），因此能读取 Dispatcher（在其容器中同为 root）以 `root:root`、目录 0750、文件 0640 写入的副本与设置文件，以及你以 0600 模式只读挂载的 agent 令牌。隔离检查在那里通过：没有 Docker socket，没有 `DOCKER_HOST`，`dispatch_config_to_check: null`（只在容器内接受），副本根目录只读挂载，配置与令牌位于只读挂载上（所有权检查跳过它们）。也可以以非 root 运行（不是默认）：第一次 `up` 之前以该用户持有的组创建副本根目录（`sudo install -d -m 2750 -o root -g <gid> datas/repair-transcripts`），在覆盖文件的 `cairn-repair` 上设置 `group_add: ["<gid>"]` 与 `user: "<uid>"`（从不在镜像中加 `USER` 行），`secrets/repair-agent.token` 属于该 uid、模式 0400，`./repair.compose.yaml` 对该 uid 可读，并在构建之前让检出中的 `repair-agent/pyproject.toml`、`repair-agent/uv.lock` 与 `repair-agent/src/` 对其他用户可读（`chmod -R a+rX repair-agent/pyproject.toml repair-agent/uv.lock repair-agent/src`）。
+- **用户**：修复代理在其容器内以 root 运行（镜像没有 `USER` 行，与今天的镜像相同），因此能读取 Dispatcher（在其容器中同为 root）以 `root:root`、目录 0750、文件 0640 写入的副本与设置文件，以及你以 0600 模式只读挂载的 agent 令牌。隔离检查在那里通过：没有 Docker socket，没有 `DOCKER_HOST`，`dispatch_config_to_check: null`（只在容器内接受），副本根目录只读挂载，配置与令牌位于只读挂载上（所有权检查跳过它们）。也可以以非 root 运行（不是默认）：第一次 `up` 之前以该用户持有的组创建副本根目录（`sudo install -d -m 2750 -o root -g <gid> datas/repair-transcripts`），在覆盖文件的 `cairn-repair` 上设置 `group_add: ["<gid>"]` 与 `user: "<uid>"`（从不在镜像中加 `USER` 行），`secrets/repair-agent.token` 属于该 uid、模式 0400，`./repair.compose.yaml` 对该 uid 可读，并在构建之前让检出中的 `repair-agent/pyproject.toml`、`repair-agent/uv.lock` 与 `repair-agent/src/` 对其他用户可读（`chmod -R a+rX repair-agent/pyproject.toml repair-agent/uv.lock repair-agent/src`）。它还需要自己的状态目录来固定评审模型：在覆盖文件中把 `cairn-repair-state` 卷那一行换成 `- ./datas/repair-state:/var/lib/cairn-repair/state`，并在第一次 `up` 之前为该用户创建这个目录：`sudo install -d -m 0700 -o <uid> -g <gid> datas/repair-state`。命名卷不适用于非 root 的修复代理，即使 `chown` 过也不行：只要有容器在卷为空时挂载它（在修复代理第一次固定之前它一直是空的），Docker 就再次给它镜像中该目录的所有者与模式（属于 root，0700），修复代理因而以 `state_dir_owner` 停止。
 - **宿主机上的模型服务**：在修复代理的容器内，`127.0.0.1` 是容器自己。宿主机上的服务以 `http://host.docker.internal:<port>/v1` 访问，即 `./dispatch.yaml` 中其评审模型条目的 `REVIEW_BASE_URL`，`extra_hosts` 把它映射到宿主机的 Docker 网桥地址（`host-gateway`：`docker0` 的地址，除非 daemon 另有配置，通常为 172.17.0.1；`ip -4 addr show docker0`）。把服务绑定到那个地址（Ollama：`OLLAMA_HOST=172.17.0.1:11434`），从不绑定 `0.0.0.0`。这个地址不是回环地址：Ollama 此时不检查 `Host` 请求头，Docker 网络上的每个容器都能访问它，经由你的宿主机路由 172.17.0.1 的局域网机器也能访问。因此让宿主机防火墙只在 `lo` 与 Docker 网桥接口（`docker0` 与 Compose 网络的 `br-…`）上放行该端口，在其他所有接口上丢弃；它不能阻断 Compose 网络。使用这个 URL 时，修复代理每次启动都会记录 `repair model endpoint is plain http on a non-loopback host endpoint=http://host.docker.internal:<port>`，这里是预期的。绑定在 172.17.0.1 的服务不再响应 `127.0.0.1`，而宿主机无法解析 `host.docker.internal`，因此在 Compose 中回放在修复代理的镜像中运行。托管服务上的评审模型（Worker 自己的服务商，或 Claude API）不需要这些：修复代理的容器经网络访问它。
 
 ### 宿主机安装：以自己的用户运行
@@ -769,13 +805,17 @@ services:
 在宿主机上（任一执行模式），修复代理以它自己的用户 `cairn-repair` 运行，使用只有 root 或该用户能修改的代码与配置；以你的用户或 root 运行会被拒绝。它的评审模型设置来自属于你的用户的 Dispatcher 设置文件。在你自己的 shell 中运行以下命令，使 `$USER` 是你：
 
 - a. `sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin cairn-repair`。永远不要把它加入 `docker` 组。
-- b. 家目录之外的副本根目录：`sudo install -d -m 0755 /var/lib/cairn-repair` 与 `sudo install -d -m 2750 -o "$USER" -g cairn-repair /var/lib/cairn-repair/transcripts`。Dispatcher 自己给每个副本与设置文件这个目录的组，因此运行 Dispatcher 的你的用户必须在这个组中：`sudo usermod -aG cairn-repair "$USER"`，然后从新的登录会话启动 Dispatcher。没有这个成员资格时，Dispatcher 记录 `repair shadow transcript copy group not set root_gid=%s`，每次评审都会变成 `transcript_unreadable`。
+- b. 家目录之外的副本根目录：`sudo install -d -m 0755 /var/lib/cairn-repair` 与 `sudo install -d -m 2750 -o "$USER" -g cairn-repair /var/lib/cairn-repair/transcripts`；以及修复代理自己的状态目录，它在其中固定评审模型：`sudo install -d -m 0700 -o cairn-repair -g cairn-repair /var/lib/cairn-repair/state`。Dispatcher 自己给每个副本与设置文件这个目录的组，因此运行 Dispatcher 的你的用户必须在这个组中：`sudo usermod -aG cairn-repair "$USER"`，然后从新的登录会话启动 Dispatcher。没有这个成员资格时，Dispatcher 记录 `repair shadow transcript copy group not set root_gid=%s`，每次评审都会变成 `transcript_unreadable`。
 - c. 代码：把 `repair-agent/pyproject.toml`、`repair-agent/uv.lock` 与 `repair-agent/src/`（即镜像复制的内容）复制到 `/opt/cairn-repair/`，把 `tools/repair-phase2/` 复制到 `/opt/cairn-repair/tools/repair-phase2/`（供以 `cairn-repair` 运行的回放使用）。在 root 对它们运行任何东西之前，让它们属于 root、所有人可读、只有 root 可写：`sudo chown -R root:root /opt/cairn-repair` 与 `sudo chmod -R u=rwX,go=rX /opt/cairn-repair`。然后用 root 拥有的 `uv`（例如以 root 运行 uv 的安装程序、设置 `UV_INSTALL_DIR=/usr/local/bin` 安装到 `/usr/local/bin` 的那个），而不是你家目录中的 `uv`，以 root 安装依赖：`sudo -H sh -c 'cd /opt/cairn-repair && UV_PYTHON_INSTALL_DIR=/opt/cairn-repair/python /usr/local/bin/uv sync --frozen --no-dev'`，之后再运行一次同样的 `chown` 与 `chmod`，覆盖 sync 新增的一切（只去掉写权限位不够）。每次更新 `repair-agent/` 之后都重复这一步。
 - d. 配置与令牌在 `/etc/cairn-repair/` 中（`sudo install -d -o root -g cairn-repair -m 0750 /etc/cairn-repair`）：`repair.yaml`（`root:cairn-repair`，0640），从 `repair-agent/repair.example.yaml` 得到，用 `sudoedit` 编辑；以及修复代理自己的 agent 令牌副本 `agent.token`：`sudo install -o cairn-repair -g cairn-repair -m 0400 secrets/repair-agent.token /etc/cairn-repair/agent.token`。这里不放任何模型 key：评审模型的 key 在 `dispatch.yaml` 中。在 `repair.yaml` 中设置 `token_file: /etc/cairn-repair/agent.token`、`transcripts.root: /var/lib/cairn-repair/transcripts`，`dispatch_config_to_check` 为 Dispatcher 的 `dispatch.yaml` 的绝对路径（模式 0600），在 `isolation.unreadable_paths` 下列出 `secrets/repair-dispatcher.token` 的绝对路径，以及对于用 `CLAUDE_CONFIG_DIR`、`CODEX_HOME` 或 `PI_CODING_AGENT_DIR` 移走的 CLI 目录，其中的每个凭据文件：`CLAUDE_CONFIG_DIR` 下的 `.credentials.json`、`settings.json` 与 `.claude.json`（设置了 `CLAUDE_CONFIG_DIR` 时 `.claude.json` 在这个目录中，而不在家目录中，Dispatcher 也从这里脱敏它）；`CODEX_HOME` 下的 `auth.json` 与 `config.toml`；`PI_CODING_AGENT_DIR` 下的 `auth.json` 与 `models.json`。逐个列出这些文件，而不是列出目录：列出的目录只测试目录自己的读权限位，因此模式为 0711 的目录能通过检查，而其中的文件仍然可读。隔离检查自己只测试家目录中的默认位置，因此漏列的文件不会被测试。相对路径或未替换的 `<…>` 占位符会让修复代理在启动时停止。`server_ca_bundle` 或评审模型的 `ca_bundle` 指向的 CA 文件也放在 `/etc/cairn-repair/` 中（`root:root`，0644），因为所有权检查像检查 `repair.yaml` 一样检查它们。
 - e. 让你的 CLI 文件对 `cairn-repair` 不可读：`chmod 0700 ~/.claude ~/.codex ~/.pi` 与 `chmod 0600 ~/.claude.json`（存在的那些），或 `chmod 0700 ~`。家目录关闭之后，该用户需要读取的东西要放在家目录之外：副本根目录已经如此，以该用户运行的回放所用的评估集也必须如此，放在它自己的目录中，而不是副本根目录中。
 - f. 以 `cairn-repair` 启动 `/opt/cairn-repair/.venv/bin/cairn-repair --config /etc/cairn-repair/repair.yaml`：`sudo -u cairn-repair …`，或 `User=cairn-repair`、以该命令为 `ExecStart` 的 systemd 单元。
 
-在宿主机上，修复代理启动时会记录 `repair reviewer settings are writable by the dispatcher's user, local workers can change them path=%s`（WARNING）。这是预期的：设置文件属于你，local 模式下你的 Worker 以你的用户运行，因此它们也能修改它。
+在宿主机上，修复代理启动时会记录 `repair reviewer settings are writable by the dispatcher's user, local workers can change them path=%s`（WARNING）。这是预期的：设置文件属于你，local 模式下你的 Worker 以你的用户运行，因此它们也能修改它。评审模型固定限制了这样的修改能做的事：第一次启动时修复代理记下第一个评审模型（名称、地址、格式、模型、`proxy` 与 `ca_bundle`）并记录 `repair reviewer pinned reviewer=%s endpoint=%s`，之后这六项中任何一项变了，它就拒绝启动，而不是把 digest 发往新的地方。局限见「启动」第 5 步：它不阻止 Worker 读取评审模型的 key 或修改其他设置（包括接收 agent 令牌与提交内容的 `server`），回放与门禁工具从不核对它，你的用户能不输密码运行 `sudo` 时它也不成立。
+
+**接受评审模型的变更**：修改 `dispatch.yaml` 中第一个评审模型的名称、地址、格式、模型、代理或 CA 文件（或把另一个评审模型排到第一位）之后，修复代理以 `repair reviewer changed since it was pinned fields=%s pin=%s` 拒绝启动。要接受这一变更，在重启 Dispatcher 之后：宿主机上运行 `sudo rm /var/lib/cairn-repair/state/reviewer-pin.json`，再启动修复代理；Compose 中运行 `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml run --rm --no-deps --entrypoint rm cairn-repair /var/lib/cairn-repair/state/reviewer-pin.json`，再运行 `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml up -d cairn-repair`。不是你做的变更，意味着 Worker 或别的进程改变了评审模型：删除任何东西之前，先查看 `dispatch.yaml` 的 `repair:` 部分与设置文件。`max_tokens` 等其他设置、key 与其他评审模型不在固定之内，修改它们从不需要删除固定文件。
+
+**从较早的 Phase 2 版本升级**：宿主机上，启动新的修复代理之前先创建状态目录（上面 b 中的 `install -d` 命令），否则它以 `repair reviewer pin unusable … reason=folder_missing` 停止；Compose 中 `up -d --build` 会创建该卷（非 root 的修复代理要先有自己的目录，见上面的「用户」）。第一次启动随后记录 `repair reviewer pinned …`。不写 `max_tokens` 的评审模型现在得到 16384（设置了 `context_window` 时更低），而不是 4096。较早的修复代理把本版本 `repair.yaml` 中的 `state:` 当作未知键拒绝：回到较早的版本之前，先从 `repair.yaml` 中删除它。
 
 ### 步骤
 
@@ -808,7 +848,7 @@ services:
 4. **修复代理**：它自己的 `repair.yaml` 保存令牌文件、副本根目录、隔离与轮询设置，不含服务端地址、项目列表、模型或 key；它在启动时从 `<transcript_root>/agent-settings.json` 读取这些，没有这个文件就以 `agent settings missing: …` 停止。因此在第 3 步的 Dispatcher 之后启动它，并在每次修改 `repair:` 部分、Dispatcher 记录了 `repair shadow agent settings written` 之后重启它。Compose 中依次运行 `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml restart cairn-dispatcher`，在 `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml logs cairn-dispatcher` 中等到那一行，再运行 `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml restart cairn-repair`：同时重启两者，修复代理可能读到旧的文件。
    - Compose：在仓库根目录（覆盖文件挂载它的位置，而不是 `repair-agent/` 中）从 `repair-agent/repair.compose.example.yaml` 写出 `./repair.compose.yaml`，替换其中的占位符（未替换的 `<…>` 会让修复代理在启动时停止），然后运行 `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml up -d --build`，它也会以第 2、3 步的设置启动服务端与 Dispatcher。
    - 宿主机：见上文「宿主机安装：以自己的用户运行」。
-   - 检查修复代理记录了 `repair agent started … reviewer=<你的第一个评审模型> … projects=all`（`projects=` 给出 `repair:` 部分中列出的数量，或 `all`）。拒绝会说明要修复什么：`repair agent isolation check failed reasons=%s`；缺失、不可读或无效的设置文件以 `agent settings missing: …`、`agent settings unreadable: …` 或 `agent settings invalid: <path>: <field>: <rule>` 停止。
+   - 检查修复代理记录了 `repair agent started … reviewer=<你的第一个评审模型> … projects=all`（`projects=` 给出 `repair:` 部分中列出的数量，或 `all`）。拒绝会说明要修复什么：`repair agent isolation check failed reasons=%s`；缺失、不可读或无效的设置文件以 `agent settings missing: …`、`agent settings unreadable: …` 或 `agent settings invalid: <path>: <field>: <rule>` 停止；评审模型固定以 `repair reviewer changed since it was pinned fields=%s pin=%s`（见上文「接受评审模型的变更」）或 `repair reviewer pin unusable path=%s reason=%s` 停止（见「启动」第 5 步）。
 5. **打开开关**：在新建项目对话框中勾选 “Repair long explores”；对已有项目，3 秒内两次点击其标题栏中的 Repair 按钮，或运行 `curl -X PUT http://127.0.0.1:8000/projects/<id>/repair -H 'Content-Type: application/json' -d '{"enabled": true}'`（没有这个请求头时 curl 把请求体作为表单发送，服务端回答 422）。服务端的 stderr 显示 `repair switch project=<id> enabled=True client=<address>`（WARNING）。打开项目的开关，就是你同意把它的运行的 digest 发送给 `dispatch.yaml` 中列出的第一个评审模型。`projects: null` 时不需要其他操作；有列表时，把项目 id 加进去，然后先重启 Dispatcher，再重启修复代理。
 6. **验证**（在一次长运行期间）：Dispatcher 记录 `repair shadow run registered`；带 agent 令牌的 `GET /repair/runs` 列出该运行；70% 时出现 `<root>/<project_id>/<run_id>/meta.json`；75%–80% 时节点显示 “Repair review: …”。
 7. **停止**：关闭开关（在项目标题栏的 Repair 按钮上点击两次，或用第 5 步的 `PUT` 发送 `{"enabled": false}`），并停止修复代理。进行中的运行保持其路径并正常结束；修复代理停止后，它们的窗口被记为未评审。所有开关都关闭时，`repair:` 部分仍会运行 Dispatcher 的 housekeeping：每次启动时写设置文件，并删除你删除的项目的副本。要完全停止，在那些运行结束之后，从 `dispatch.yaml` 中删除该部分，重启 Dispatcher，并删除保存着评审模型 key 的 `<root>/agent-settings.json`（Compose 中它属于 root，需要 `sudo`）；根目录中留下的副本会一直保留，直到你删除它们。Compose 中从 `./dispatch.yaml` 删除该部分，然后运行 `docker compose -f docker-compose.yaml up -d --remove-orphans`，它不带覆盖文件重建服务端与 Dispatcher，并删除修复代理的容器。删除项目会在同一事务中删除它的修复数据，无论修复层是否在运行。

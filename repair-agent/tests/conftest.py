@@ -1,11 +1,15 @@
 """Shared fixtures for the repair agent's tests.
 
 Every value here is synthetic: made-up tokens and keys, `test-model`, and loopback stub servers. Two layouts:
-- `layout`: a repair.yaml, token, copy root and settings file under the test's own folder, owned by whoever runs
-  the tests. The agent runs in this process.
+- `layout`: a repair.yaml, token, copy root, state folder and settings file under the test's own folder, owned by
+  whoever runs the tests. The agent runs in this process.
 - `host_install`: the host install of spec §13 step 4, with the dispatcher's user, the agent's user and root as
   distinct owners. The agent runs in a forked child that drops to the agent's uid, as `sudo -u cairn-repair` would,
   so the isolation check sees real permissions. It needs root and is skipped otherwise.
+
+Each layout's repair.yaml names its own state folder, where the agent pins its reviewer (owner decision O9). Most
+tests change the reviewer between two starts of the agent, which the pin would refuse, so outside the pin's own tests
+(marked `reviewer_pin`) every start of the agent in this process pins its reviewer afresh.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ import yaml
 
 # start() imports these after its environment guard. Import them here, so that a child that has dropped its
 # privileges finds them loaded and needs no read access to the virtual environment.
-from cairn_repair_agent import cli, config, isolation, model, server  # noqa: F401
+from cairn_repair_agent import cli, config, isolation, model, pin, server  # noqa: F401
 
 AGENT_UID = AGENT_GID = 61001
 DISPATCHER_UID = DISPATCHER_GID = 61002
@@ -123,6 +127,26 @@ def _empty_system_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch: py
     system = tmp_path_factory.mktemp("system-root")
     monkeypatch.setattr(isolation, "SYSTEM_ROOT", str(system))
     return system
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "reviewer_pin: the reviewer pin persists between starts, as in the agent")
+
+
+@pytest.fixture(autouse=True)
+def _each_start_pins_afresh(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Outside the pin's own tests, each start of the agent in this process finds no pin and pins its reviewer, as a
+    start does once the owner has accepted a change by removing the pin file (owner decision O9)."""
+    if request.node.get_closest_marker("reviewer_pin") is not None:
+        return
+    real_check = pin.check_reviewer_pin
+
+    def check_afresh(state_dir: str, reviewer: Any, endpoint: str) -> None:
+        with contextlib.suppress(OSError):
+            os.unlink(pin.pin_path(state_dir))
+        real_check(state_dir, reviewer, endpoint)
+
+    monkeypatch.setattr(pin, "check_reviewer_pin", check_afresh)
 
 
 # --- running the agent --------------------------------------------------------------------------------------------
@@ -230,6 +254,7 @@ class Layout:
     settings_path: Path
     dispatch_path: Path
     config: dict[str, Any] = field(default_factory=dict)
+    state_dir: Path = Path()  # the agent's state folder (repair.yaml's state.dir), which holds the reviewer pin
 
     def write_config(self, data: dict[str, Any] | None = None, **changes: Any) -> Path:
         content = dict(self.config if data is None else data)
@@ -254,6 +279,9 @@ class Layout:
 def layout(tmp_path: Path) -> Layout:
     root = tmp_path / "transcripts"
     root.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    set_mode(state, 0o700)
     lay = Layout(
         base=tmp_path,
         config_path=tmp_path / "repair.yaml",
@@ -261,12 +289,14 @@ def layout(tmp_path: Path) -> Layout:
         root=root,
         settings_path=root / config.SETTINGS_FILE_NAME,
         dispatch_path=tmp_path / "dispatch.yaml",
+        state_dir=state,
     )
     lay.write_config(
         {
             "token_file": str(lay.token_path),
             "dispatch_config_to_check": str(lay.dispatch_path),
             "transcripts": {"root": str(root)},
+            "state": {"dir": str(state)},
         }
     )
     lay.write_settings(settings_data())
@@ -305,6 +335,8 @@ class HostInstall(Layout):
         return run_in_child(body, uid, groups[0], list(groups))
 
     def start(self, *extra: str, uid: int = AGENT_UID, groups: tuple[int, ...] = (AGENT_GID,)) -> AgentRun:
+        # The state folder belongs to the user the agent runs as (§13 step 4 b), whichever user a test starts it as.
+        os.chown(self.state_dir, uid, groups[0])
         return run_agent(self.argv(*extra), as_user=(uid, groups[0], list(groups)))
 
 
@@ -336,6 +368,9 @@ def host_install(monkeypatch: pytest.MonkeyPatch) -> Iterator[HostInstall]:
         root = base / "transcripts"
         root.mkdir()
         _chown(root, DISPATCHER_UID, AGENT_GID, 0o2750)
+        state = base / "state"
+        state.mkdir()
+        _chown(state, AGENT_UID, AGENT_GID, 0o700)
         packages = []
         for name in ("package", "purelib", "platlib"):
             folder = base / "opt" / name
@@ -350,6 +385,7 @@ def host_install(monkeypatch: pytest.MonkeyPatch) -> Iterator[HostInstall]:
             root=root,
             settings_path=root / config.SETTINGS_FILE_NAME,
             dispatch_path=dispatch,
+            state_dir=state,
             system=system,
             home=home,
             packages=packages,
@@ -368,6 +404,7 @@ def host_install(monkeypatch: pytest.MonkeyPatch) -> Iterator[HostInstall]:
                 "token_file": str(token),
                 "dispatch_config_to_check": str(dispatch),
                 "transcripts": {"root": str(root)},
+                "state": {"dir": str(state)},
             }
         )
         install.write_settings(settings_data())

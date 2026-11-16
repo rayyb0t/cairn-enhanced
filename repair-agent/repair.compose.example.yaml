@@ -16,3 +16,5 @@ transcripts:
   max_staleness_seconds: 45                          # how much older than the window's opening the copy's last check may be
 digest:
   max_tokens_estimate: 8000                          # the digest budget; a reviewer's context_window can lower it
+state:
+  dir: "/var/lib/cairn-repair/state"                 # the volume cairn-repair-state, root's, 0700: its reviewer pin
