@@ -547,10 +547,15 @@ def test_settings_file_is_read_safely_and_strictly_spec_example_starts_and_is_re
 
 
 def test_example_configurations_hold_only_the_agents_own_settings(
-    layout: Layout, capsys: pytest.CaptureFixture[str]
+    layout: Layout, capsys: pytest.CaptureFixture[str], stub_server: Any
 ) -> None:
     """§13: the two examples hold the agent's own settings only (no server, project, model or key); the Compose
-    example parses as is (with its copy root moved here), and the host example's placeholders stop the agent."""
+    example parses as is (with its copy root moved here), and the host example's placeholders stop the agent.
+    `cairn-repair` enters the review loop after its startup (§9.3 step 7), so it runs with `--once` here, against a
+    stub server that lists no run."""
+    layout.write_settings(
+        settings_data(server=stub_server(body={"server_time": "2026-11-14T10:00:00Z", "runs": []}).url)
+    )
     host = yaml.safe_load((PROJECT / "repair.example.yaml").read_text(encoding="utf-8"))
     compose = yaml.safe_load((PROJECT / "repair.compose.example.yaml").read_text(encoding="utf-8"))
     for example in (host, compose):
@@ -567,7 +572,7 @@ def test_example_configurations_hold_only_the_agents_own_settings(
         example = dict(example, token_file=str(layout.token_path))
         example["transcripts"] = dict(example["transcripts"], root=str(layout.root))
         layout.write_config(example)
-        code, stderr = run_main(layout, capsys, "--allow-shared-user")
+        code, stderr = run_main(layout, capsys, "--allow-shared-user", "--once")
         if name == "compose":
             assert code == 0, stderr
             assert "agent config invalid" not in stderr

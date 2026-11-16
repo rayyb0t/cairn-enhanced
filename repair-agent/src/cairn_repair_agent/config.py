@@ -20,7 +20,7 @@ import re
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import yaml
@@ -58,6 +58,10 @@ DEFAULT_STRUCTURED_OUTPUT = True
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_ATTEMPTS = 2
+# The two wire formats of the one model client (owner decision O8, Appendix C-1, Wire formats).
+OPENAI_CHAT = "openai_chat"
+ANTHROPIC_MESSAGES = "anthropic_messages"
+ApiFormat = Literal["openai_chat", "anthropic_messages"]
 
 REVIEWER_NAME_RULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 ENV_NAME_RULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
@@ -114,9 +118,13 @@ SETTINGS_RULES = {
     "model": MODEL_NAME_RULE_TEXT,
     "base_url": (
         "must be an http:// or https:// URL with a host, and a port from 1 to 65535 if it has one, "
-        "to which /chat/completions is appended"
+        "to which the path of the reviewer's api_format is appended: /chat/completions for openai_chat, "
+        "/v1/messages for anthropic_messages"
     ),
-    "api_key": "must be null or a non-empty string of printable ASCII (0x20-0x7E)",
+    "api_format": "must be openai_chat or anthropic_messages; left out or null is openai_chat",
+    "api_key": (
+        "must be null or a non-empty string of printable ASCII (0x20-0x7E) that neither starts nor ends with a space"
+    ),
     "structured_output": "must be null, true or false",
     "max_tokens": "must be null or an integer of at least 1",
     "context_window": "must be null or an integer of at least 1",
@@ -128,6 +136,9 @@ SETTINGS_RULES = {
     "input_per_mtok": "must be a finite number of at least 0",
     "output_per_mtok": "must be a finite number of at least 0",
 }
+# The two rules of anthropic_messages have texts of their own: the shared ones state rules that null and true meet.
+KEY_REQUIRED_RULE = "required with api_format anthropic_messages"
+NO_SCHEMA_RULE = "must be left out, null or false with api_format anthropic_messages"
 
 
 class StartupError(Exception):
@@ -222,7 +233,9 @@ def _http_url(field: str) -> Any:
 
 
 def _api_key(value: str) -> str:
-    if not value or not is_printable_ascii(value):
+    # requests refuses a header value that starts with a space, with an InvalidHeader whose message holds the value,
+    # and with anthropic_messages the key is the whole x-api-key value; the dispatcher removes the spaces (§8.3).
+    if not value or not is_printable_ascii(value) or value[0] == " " or value[-1] == " ":
         raise _rule(SETTINGS_RULES["api_key"])
     return value
 
@@ -284,13 +297,23 @@ class Price(_Model):
 
 
 class ReviewerSettings(_Model):
-    """One reviewer of the settings file. Optional settings left out or null take Appendix C-1's defaults."""
+    """One reviewer of the settings file. Optional settings left out or null take Appendix C-1's defaults.
+
+    `api_format` comes before `api_key` and `structured_output`, whose rules depend on it (§9.2): their validators
+    read it from the fields validated before them. With `anthropic_messages` the key is required, and
+    `structured_output` must be left out, null or false, and is then false: that call sends no JSON schema.
+    """
 
     name: Annotated[StrictStr, AfterValidator(_reviewer_name)]
     model: Annotated[StrictStr, AfterValidator(_model_name)]
     base_url: Annotated[StrictStr, AfterValidator(_http_url("base_url"))]
-    api_key: Annotated[StrictStr, AfterValidator(_api_key)] | None = Field(default=None, repr=False)
-    structured_output: StrictBool = DEFAULT_STRUCTURED_OUTPUT
+    api_format: ApiFormat = OPENAI_CHAT
+    # validate_default: a key left out is checked against the format as a null one is.
+    api_key: Annotated[StrictStr, AfterValidator(_api_key)] | None = Field(
+        default=None, repr=False, validate_default=True
+    )
+    # None until validated: left out, it is checked against the format as a null one is, then takes the format's value.
+    structured_output: StrictBool = Field(default=None, validate_default=True)
     max_tokens: PositiveInt = DEFAULT_MAX_TOKENS
     context_window: PositiveInt | None = None
     timeout_seconds: PositiveInt = DEFAULT_TIMEOUT_SECONDS
@@ -299,7 +322,28 @@ class ReviewerSettings(_Model):
     proxy: Annotated[StrictStr, AfterValidator(_http_url("proxy"))] | None = None
     price: Price | None = None
 
-    @field_validator("structured_output", "max_tokens", "timeout_seconds", "max_attempts", mode="before")
+    @field_validator("api_format", mode="before")
+    @classmethod
+    def _null_format_is_openai_chat(cls, value: Any) -> Any:
+        return OPENAI_CHAT if value is None else value
+
+    @field_validator("api_key")
+    @classmethod
+    def _key_for_the_format(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None and info.data.get("api_format") == ANTHROPIC_MESSAGES:
+            raise _rule(KEY_REQUIRED_RULE)
+        return value
+
+    @field_validator("structured_output", mode="before")
+    @classmethod
+    def _structured_output_for_the_format(cls, value: Any, info: ValidationInfo) -> Any:
+        if info.data.get("api_format") == ANTHROPIC_MESSAGES:
+            if value is None or value is False:
+                return False  # the setting's default does not apply to this format
+            raise _rule(NO_SCHEMA_RULE)
+        return DEFAULT_STRUCTURED_OUTPUT if value is None else value
+
+    @field_validator("max_tokens", "timeout_seconds", "max_attempts", mode="before")
     @classmethod
     def _null_takes_the_default(cls, value: Any, info: ValidationInfo) -> Any:
         if value is None and info.field_name is not None:
@@ -345,8 +389,9 @@ def _rule_for(error: Mapping[str, Any], rules: Mapping[str, str]) -> str:
     if kind == "extra_forbidden":
         if names and names[-1] in REMOVED_REVIEWER_KEYS:
             return (
-                "unknown key: there is one model client, the OpenAI-compatible one, and the settings of the "
-                "removed Anthropic client are gone"
+                "unknown key: there is one model client, which makes the call that the reviewer's api_format names, "
+                "and the settings of the removed Anthropic client are gone; a Claude API key takes api_format: "
+                "anthropic_messages"
             )
         return "unknown key"
     for name in reversed(names):

@@ -3,10 +3,11 @@
 The startup, in order: load `repair.yaml`, read the token and the optional server API key, read the dispatcher's
 settings file; run the isolation check; strip the proxy, CA, netrc and key-log variables from the environment; quiet
 urllib3's logger; build the server client and the first reviewer's model client; log the settings-file WARNINGs and
-the `repair agent started` line. Every startup failure exits with code 2.
+the `repair agent started` line. Every startup failure exits with code 2. Then `main` enters the review loop
+(`loop.run_agent`, §9.3 step 7): until SIGINT or SIGTERM, or for one poll with `--once`.
 
-This module imports neither `requests` nor the clients at module level: they are imported only after the
-environment guard, so no TLS context or session can ever be made from the variables it removes.
+This module imports neither `requests` nor the clients, nor the loop, at module level: they are imported only after
+the environment guard, so no TLS context or session can ever be made from the variables it removes.
 """
 
 from __future__ import annotations
@@ -167,8 +168,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     agent = start_or_report(args)
     if agent is None:
         return 2
-    # The review loop (§9.4, §9.9) runs on the started agent here; it comes with the review pipeline.
-    return 0
+    from .loop import run_agent  # after the environment guard (see the module docstring)
+
+    return run_agent(agent)
 
 
 if __name__ == "__main__":
