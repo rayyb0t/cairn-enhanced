@@ -441,6 +441,92 @@ or close your whole home with `chmod 0700 ~`. With a closed home, keep what `cai
 outside it: the copy root already is, and so must be the eval set of a replay run as that user, in a
 folder of its own, not inside the copy root.
 
+**Local mode: your workers' temporary output.** The CLIs that local workers run also leave raw run
+output, which the dispatcher's redaction never sees (it redacts only its copies), in the shared `/tmp`,
+in folders and files they create with the default mode, which every local user, `cairn-repair`
+included, can read under a umask of 022 or 002:
+
+- Claude Code (checked on 2.1.98, the version the worker image pins; local workers run yours) keeps
+  the whole output of each background job (a `run_in_background` command, or a command that runs past
+  its timeout) in `<temp>/claude-<your uid>/<project>/<session>/tasks/<id>.output`. `<temp>` is
+  `CLAUDE_CODE_TMPDIR` when it is set, else `$TMPDIR`, else `/tmp`.
+- pi (checked on 0.73.0, the pinned version) writes each session, the whole transcript, under
+  `/tmp/cairn-pi/<worker>/sessions`, which Cairn's pi wrapper creates with `mkdir -p`, and spills the
+  full output of a bash call over 50 KB to `$TMPDIR/pi-bash-<16 hex digits>.log` (`/tmp` by default),
+  which it keeps.
+
+Give them private folders. Local workers inherit the dispatcher's environment, so for Claude Code
+workers export this in the shell that starts the dispatcher:
+
+```bash
+install -d -m 0700 ~/.claude/tmp
+export CLAUDE_CODE_TMPDIR=$HOME/.claude/tmp
+```
+
+For pi workers, give `/tmp/cairn-pi`, where their sessions go whatever `TMPDIR` says, mode 0700 at
+every boot (`/tmp` is emptied at boot, and `mkdir -p` keeps the mode of a folder that is there) with a
+tmpfiles.d line, which also sets the mode of the folder now; and export a private `TMPDIR` in the same
+shell, for pi's spill files (it also moves the temporary files of the tools your workers run there):
+
+```bash
+echo "d /tmp/cairn-pi 0700 $USER $(id -gn) -" | sudo tee /etc/tmpfiles.d/cairn-pi.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/cairn-pi.conf
+install -d -m 0700 ~/.cache/cairn-tmp
+export TMPDIR=$HOME/.cache/cairn-tmp
+```
+
+An export reaches only the programs that this shell starts after it. A dispatcher that is already
+running (step 3) keeps the environment it started with, and so do the local workers it starts: so
+restart the dispatcher (step 3) from this shell. Then make every later start get them, after a new
+login or a reboot too: put the `export` lines you use in your login profile (for example
+`~/.profile`), or set the variables on the command line that starts the dispatcher:
+
+```bash
+CLAUDE_CODE_TMPDIR=$HOME/.claude/tmp TMPDIR=$HOME/.cache/cairn-tmp uv run --project cairn cairn dispatch --config dispatch.yaml
+```
+
+What earlier runs left keeps its mode: run `chmod 0700 /tmp/claude-$(id -u)` if that folder exists,
+and remove your `/tmp/pi-bash-*.log` files. At every start the agent checks the default places and,
+when it can list `/tmp/claude-<your uid>` or `/tmp/cairn-pi`, or read one of your `/tmp/pi-bash-*.log`
+files, logs one WARNING that names them (Check, below); it starts all the same. In container mode and
+in Compose the workers' `/tmp` is inside their containers, and none of this applies.
+
+**Local mode: what the dispatcher's redaction does not read.** In local mode the dispatcher removes from
+its copies, by exact value, its own token, the reviewers' keys and the secrets of your environment
+(which local workers inherit), of the workers' `env` and of your CLIs' seven credential files: Claude
+Code's `~/.claude/.credentials.json`, `~/.claude.json` and the `env` of `~/.claude/settings.json`;
+codex's `~/.codex/auth.json` and `~/.codex/config.toml`; pi's `~/.pi/agent/auth.json` and
+`~/.pi/agent/models.json` (or those in the folders that `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and
+`PI_CODING_AGENT_DIR` name). Your CLIs also take environment variables and request headers from places
+it does not read. A secret set only in one of them (an OpenTelemetry exporter's
+`OTEL_EXPORTER_OTLP_HEADERS`, a gateway's `ANTHROPIC_CUSTOM_HEADERS`, an MCP server's header) is in your
+workers' environment or files but not among those values: a run that prints it puts it in its copy,
+and from there only the agent's pattern layer, which recognises common key formats, keeps it out of the
+digest that goes to the reviewer and that the server keeps. For Claude Code 2.1.98 these places are:
+
+- its managed settings, whose `env` it applies last, over that of your `settings.json`:
+  `/etc/claude-code/managed-settings.json` and the `.json` files in
+  `/etc/claude-code/managed-settings.d/` (on macOS in `/Library/Application Support/ClaudeCode/`), a
+  macOS configuration profile for `com.anthropic.claudecode`, or your organisation's server-managed
+  settings, which it keeps in `~/.claude/remote-settings.json`;
+- the MCP servers of `managed-mcp.json` in that folder, and those of the `.mcp.json` in a run's work
+  folder and in each folder above it but `/` (by default the work folders are in the folder you start
+  the dispatcher in, so that folder's `.mcp.json` counts, and your home's when that folder is in it);
+- `~/.claude/.config.json`, which it reads instead of `~/.claude.json` when that file exists, and
+  `~/.claude-custom-oauth.json`, which it reads instead when `CLAUDE_CODE_CUSTOM_OAUTH_URL` is set.
+
+codex 0.118.0 also loads configuration layers besides `~/.codex/config.toml` (its binary names
+`/etc/codex/config.toml`, `/etc/codex/managed_config.toml` and a project's `.codex/config.toml`). To
+see which of these you have (with `CLAUDE_CONFIG_DIR` set, look for `remote-settings.json`,
+`.config.json` and `.claude-custom-oauth.json` in that folder instead):
+
+```bash
+ls -d /etc/claude-code /etc/codex ~/.claude/remote-settings.json ~/.claude/.config.json ~/.claude-custom-oauth.json ~/.mcp.json 2>/dev/null
+```
+
+Keep secrets out of these places where that is yours to decide. A secret that has to stay in one of
+them is covered by the pattern layer alone.
+
 **f. Start the agent** as `cairn-repair`:
 
 ```bash
@@ -512,6 +598,18 @@ repair agent started server=http://127.0.0.1:8000 reviewer=reviewer_claude model
 plain `http://` address that is not loopback also logs `repair model endpoint is plain http on a
 non-loopback host endpoint=…`; in Compose, with a model server on the host, that is expected.
 
+On a host, if the agent can list a worker temp folder of yours, or read one of pi's spill files, it
+logs, and starts all the same:
+
+```
+repair agent can read local workers' temporary output paths=/tmp/claude-1000,/tmp/cairn-pi; give them private temp folders (runbook, host install, step 4 e)
+```
+
+Follow step 4 e's "Local mode: your workers' temporary output" for the paths it names
+(`/tmp/claude-<your uid>`, `/tmp/cairn-pi` and `/tmp/pi-bash-*.log`), including its restart of the
+dispatcher from the shell that has the exports; the line can come back after a reboot or a new
+login if the exports are not in your login profile or on the dispatcher's command line.
+
 A refusal names what to fix. A missing, unreadable or invalid settings file stops the agent at its
 start with `agent settings missing: …` (start the dispatcher with its `repair:` section first),
 `agent settings unreadable: …` (the agent's user must hold the copy root's group: step 4 b) or
@@ -576,12 +674,16 @@ creates the `cairn-repair-state` volume (a non-root agent needs its own folder f
 The first start then logs `repair reviewer pinned …`. A
 reviewer that leaves `max_tokens` out now gets 16384 rather than 4096, or less with `context_window`
 (step 3). An earlier agent refuses the `state:` key of this build's `repair.yaml` as unknown: to go
-back to an earlier build, remove that key from `repair.yaml` first.
+back to an earlier build, remove that key from `repair.yaml` first. On a host in local mode, the agent
+now also logs a WARNING at its start while it can read your local workers' temporary output (Check);
+give them private temp folders as step 4 e says, then restart the dispatcher from a shell that has the
+exports.
 
 ## 5. Switch on
 
 Tick "Repair long explores" in the New Project dialog. For an existing project, click the Repair
-button in its header twice within 3 s, or run:
+button in its header twice within 3 s (in a window narrower than 1100 px it shows only its icon, a
+circle, left of Delete; the first click shows its whole label), or run:
 
 ```bash
 curl -X PUT --noproxy '*' http://127.0.0.1:8000/projects/<id>/repair -H 'Content-Type: application/json' -d '{"enabled": true}'

@@ -148,6 +148,17 @@
   .title-action-trigger {
     min-width: 0;
   }
+  /* The Repair button shows only its icon below a window width of 1100 px, as a 26 px square, the height of the
+     header's other buttons: it then takes 32 px of the header's room rather than 84, which the base header no longer
+     has to spare there. Its title and aria-label keep the label, and an armed button shows its whole label. */
+  @media (max-width: 1099.98px) {
+    [data-repair-button]:not([data-repair-armed]) {
+      padding: 5px;
+    }
+    [data-repair-button]:not([data-repair-armed]) > span {
+      display: none;
+    }
+  }
   .title-action-button {
     opacity: 1;
     transform: translateY(0);
@@ -474,6 +485,7 @@
       <template x-if="!replay.active">
         <button type="button" data-repair-button @click="repairButtonClick($event)" @keydown.enter="repairButtonKeydown($event)"
           :aria-pressed="project.project.repair_enabled ? 'true' : 'false'"
+          :aria-label="repairButtonLabel()" :data-repair-armed="repairButtonArmed()"
           :title="repairButtonTitle()"
           class="px-2.5 py-1 rounded-lg border text-xs transition flex items-center gap-1.5" style="white-space: nowrap"
           :class="project.project.repair_enabled
@@ -1699,9 +1711,12 @@ function cairnApp() {
     // The Repair button (shadow mode): a first click arms it and a second, separate click within 3 s switches, armed
     // per project and target state. Its label never wraps, or arming would grow the header and setupAutoFit would
     // refit the graph. The nowrap is an inline style: a class no other rendered element has (whitespace-nowrap) would
-    // make the Tailwind CDN rebuild on every project. A known limitation: the button takes header room, so in a narrow
-    // window the title group's badges overflow onto the counters below a width about 85 px greater than on the base
-    // page (about 200 px with the chip, more while armed); an icon-only label would only narrow that band.
+    // make the Tailwind CDN rebuild on every project. Below a window width of 1100 px the button shows only its icon
+    // (a rule in the page's <style>, keyed on data-repair-armed, which is set while armed), so it takes 32 px of the
+    // header's room there rather than 84. A known limitation: in a window narrow enough that the base header has no
+    // room to spare either, the title is cut and the counters wrap at a width about 32 px greater than on the base page,
+    // and the title group's badges reach the counters at a width about 32 px greater (more with the chip, and while
+    // armed, which shows the whole label).
     repairButtonArmed() {
       const p = this.project?.project;
       return !!p && this.repairArmedFor === `${p.id}:${!p.repair_enabled}`;

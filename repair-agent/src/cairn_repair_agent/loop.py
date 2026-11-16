@@ -24,7 +24,9 @@ names, else as `other`. With `--dry-run` nothing is posted.
 A failed poll is retried after `poll_interval`, doubling with each failure in a row, but never later than 15 s (or
 `poll_interval`, when that is longer): a window is open for at least 17 s (a 351 s budget), so after an outage the next
 poll still finds it open. An exception from a poll, which the server client turns into status 0 wherever it can, is a
-failed poll too: logged with its class name only, and never the end of the loop.
+failed poll too: logged with its class name only, and never the end of the loop. A poll of status 0 is logged with
+the class that the server client recorded (`status=0 error=OSError`), so a local failure, such as a CA file removed
+after the start, can be told from an outage.
 
 SIGINT or SIGTERM stops polling and waits up to 15 s for the reviews in flight; a second signal exits at once (§9.3
 step 7). A poll that a signal interrupts starts no review after it. With `--once` the agent waits for every review its
@@ -67,6 +69,7 @@ SHUTDOWN_WAIT_SECONDS = 15.0
 STOP_CHECK_SECONDS = 0.1  # how often a wait looks for a signal: between polls, and with --once for the reviews
 POST_DEADLINE_PASSED = "post_deadline"  # `status=` of a review that ended too late to be posted
 _SERVER_NAME = re.compile(r"[A-Za-z0-9_.]{1,64}")
+_CLASS_NAME = re.compile(r"[A-Za-z0-9_]{1,64}")  # a recorded exception class shown in a log line, as review.class_name
 _FIELDS_SHOWN = 10
 
 
@@ -213,7 +216,7 @@ class RepairAgent:
         answer = self.server.list_runs()
         poll, runs = self._read_poll(answer)
         if poll is None or runs is None:
-            return self._poll_failed(answer.status)
+            return self._poll_failed(answer.status, answer.error)
         self._poll_failures = 0
         for run in runs:
             if self._stop is not None and self._stop.is_set():
@@ -223,13 +226,20 @@ class RepairAgent:
         self._forget(poll.mono_at_response)
         return self.config.poll_interval
 
-    def _poll_failed(self, status: object) -> int:
+    def _poll_failed(self, status: object, error: object = None) -> int:
         """Log a failed poll and return the seconds to its retry: `poll_interval`, doubled with each failure in a row,
-        at most POLL_RETRY_MAX_SECONDS (or `poll_interval`, when that is longer)."""
+        at most POLL_RETRY_MAX_SECONDS (or `poll_interval`, when that is longer). A poll without an answer (status 0)
+        is logged with the exception class that the server client recorded for it, never the message, so that a
+        local failure, such as a CA file removed after the start (`OSError`), does not read as a server outage
+        (`ConnectionError`): `other` for a name that is not a plain identifier, `-` when none was recorded."""
         self._poll_failures += 1
         interval = self.config.poll_interval
         retry_in = min(max(interval, POLL_RETRY_MAX_SECONDS), interval * 2 ** min(self._poll_failures - 1, 4))
-        logger.warning("repair agent poll failed status=%s retry_in=%ss", status, retry_in)
+        if status == 0:
+            shown = "-" if not isinstance(error, str) else error if _CLASS_NAME.fullmatch(error) else "other"
+            logger.warning("repair agent poll failed status=0 error=%s retry_in=%ss", shown, retry_in)
+        else:
+            logger.warning("repair agent poll failed status=%s retry_in=%ss", status, retry_in)
         return retry_in
 
     def _read_poll(self, answer: ServerAnswer) -> tuple[Poll | None, list[Any] | None]:

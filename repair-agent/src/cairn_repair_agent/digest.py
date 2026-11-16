@@ -10,11 +10,13 @@ output, which the last calls only quote.
 
 Untrusted text is cleaned in this order (`clean_text`): NFKC; removal of Unicode Cc (except `\\n` and `\\t`), Cf, Cn,
 Co and Cs; exact-value removal of the agent's own secrets; `<` and `>` mapped to U+2039 and U+203A, the square brackets
-of a chat template's control token (`[INST]`, `[/INST]`, `[SYSTEM_PROMPT]`, `[|user|]`, `[|endofturn|]`, `[unused9]`,
-in any case) to U+27E6 and U+27E7, and `untrusted...data` look-alikes rewritten to `untrusted-text`, so run text can
-neither open nor close the fence, nor write a turn boundary into a rendered chat template; then the pattern layer. A
-text is cleaned before it is cut to its limit, so no secret is cut in half before a layer could see it; a long one only
-in parts near what can be shown, cut at line breaks, or inside a line with a guard (`_Cleaner`).
+of a chat template's control token to U+27E6 and U+27E7 (an upper-case word such as `[INST]`, `[/INST]`, `[EOS]` or
+`[PAD]`, and `[@BOS@]`; `[gMASK]` and the rest of `CONTROL_WORDS` in any case; `[|user|]` and `[|endofturn|]`;
+`[unused9]`; and `]~!b[`, `]~b]` and `[e~[`), and `untrusted...data` look-alikes rewritten to `untrusted-text`, so run
+text can neither open nor close the fence, nor write a turn boundary into a rendered chat template; then the pattern
+layer, and the brackets' mapping once more, since a marker of that layer brings square brackets of its own. A text is
+cleaned before it is cut to its limit, so no secret is cut in half before a layer could see it; a long one only in
+parts near what can be shown, cut at line breaks, or inside a line with a guard (`_Cleaner`).
 
 Size ladder, while over budget: last calls 12 → 10 → … → 4; output lines and message and fact lengths halved; output
 lines 0+1, messages 300, facts 150; 2 calls only; finally a cut inside the fence that keeps the closing tag. Every limit
@@ -58,17 +60,30 @@ FACT_ID_CHARS = 40
 _RUN_ID_RULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{7,63}")
 _FENCE_LOOKALIKE = re.compile(r"untrusted[\s_\-\u2010-\u2015\u2212]*data", re.IGNORECASE)
 _ANGLES = str.maketrans({"<": LEFT_ANGLE, ">": RIGHT_ANGLE})
-LEFT_WHITE_BRACKET = "\u27e6"  # MATHEMATICAL LEFT WHITE SQUARE BRACKET, for the '[' of a control token in run text
+LEFT_WHITE_BRACKET = "\u27e6"  # MATHEMATICAL LEFT WHITE SQUARE BRACKET, for a '[' of a control token in run text
 RIGHT_WHITE_BRACKET = "\u27e7"  # MATHEMATICAL RIGHT WHITE SQUARE BRACKET, for its ']'
-# The control tokens that chat templates write in square brackets. A local model server renders the chat template with
-# the digest inside and tokenizes that string with special-token parsing (Ollama's runner does, and so does a server
-# that tokenizes with a Hugging Face tokenizer), so such a token in run text would become a real turn boundary. Three
-# shapes, as the chat templates of local model servers write them (as of 2026-11):
-# - a word of CONTROL_WORDS, also closed with '/': the whole set of the model family whose templates use [INST] and
-#   [/INST] (the special tokens its tokenizer library lists), and another family's MASK words;
+_WHITE_BRACKETS = str.maketrans({"[": LEFT_WHITE_BRACKET, "]": RIGHT_WHITE_BRACKET})
+# The control tokens that chat templates and vocabularies write with square brackets. A local model server renders the
+# chat template with the digest inside and tokenizes that string with special-token parsing (Ollama's runner does, so
+# does the server of the inference library it builds on, and so does a server that tokenizes with a Hugging Face
+# tokenizer), so such a token in run text would become a real turn boundary or control token. Every square bracket of
+# a match becomes U+27E6 or U+27E7. Other square brackets stay as they are: tool output is full of them ([*], [+], [!],
+# JSON arrays), and each white bracket is 3 UTF-8 bytes of the digest's room. The shapes, from a survey of the chat
+# templates, the vocabularies and the control-token names that such a library ships (as of 2026-11):
+# - an upper-case word of 2 to 32 letters, digits and underscores, also closed with '/', matched case-sensitively: the
+#   end-of-text, padding and separator tokens ([EOT], [EOS], [BOS], [PAD], [PAD<n>], [CLS], [SEP], [UNK], [MASK]), the
+#   [INST] family's words below as written, and any future upper-case control word; log levels such as [INFO] are
+#   mapped too, harmlessly; and such a word between '@' signs, a control token of another family's vocabulary ([@BOS@]);
+# - a word of CONTROL_WORDS in any case, also closed with '/': the whole set of the model family whose templates use
+#   [INST] and [/INST] (the special tokens its tokenizer library lists), and another family's MASK words, which it
+#   writes in mixed case ([gMASK], [sMASK]);
 # - any word between '[|' and '|]': a third family's templates write their role and end-of-turn markers so
 #   ([|system|], [|user|], [|assistant|], [|tool|], [|endofturn|]);
-# - a reserved word '[unused<n>]': a fourth family's templates open and close each turn with [unused9] and [unused10].
+# - a reserved word '[unused<n>]': a fourth family's templates open and close each turn with [unused9] and [unused10];
+# - three tokens of no word: a fifth family's templates open the conversation with ']~!b[', each turn with ']~b]' and
+#   its role word (']~b]system', ']~b]user', ']~b]ai', ']~b]tool'), and close each turn with '[e~['.
+# Every token of these shapes starts and ends with a square bracket, and a match maps all of its brackets, so no token
+# of them survives cleaning, however tokens are run together or overlap.
 CONTROL_WORDS = (
     "INST",
     "SYSTEM_PROMPT",
@@ -97,8 +112,14 @@ CONTROL_WORDS = (
     "GMASK",
     "SMASK",
 )
+_UPPER_WORD = r"(?-i:[A-Z][A-Z0-9_]{1,31})"  # case-sensitive inside the case-insensitive pattern below
 _CONTROL_TOKEN = re.compile(
-    r"\[(/?(?:" + "|".join(sorted(CONTROL_WORDS, key=len, reverse=True)) + r")|\|[A-Za-z_]{1,32}\||unused\d{1,4})\]",
+    r"\[/?(?:" + "|".join(sorted(CONTROL_WORDS, key=len, reverse=True)) + r")\]"
+    r"|\[/?" + _UPPER_WORD + r"\]"
+    r"|\[@" + _UPPER_WORD + r"@\]"
+    r"|\[\|[A-Za-z_]{1,32}\|\]"
+    r"|\[unused\d{1,4}\]"
+    r"|\]~!b\[|\]~b\]|\[e~\[",
     re.IGNORECASE,
 )
 # --- tokens and budget --------------------------------------------------------------------------------------------------
@@ -266,20 +287,24 @@ def _without_unwanted(match: re.Match[str]) -> str:
 
 
 def _white_brackets(match: re.Match[str]) -> str:
-    return LEFT_WHITE_BRACKET + match.group(1) + RIGHT_WHITE_BRACKET
+    return match.group().translate(_WHITE_BRACKETS)
 
 
 def clean_text(text: str, exact: ExactSecrets, counts: Counter[str]) -> str:
     """Spec §9.6's cleaning of untrusted text, steps 1-5 in order; redactions are counted into `counts`. Step 4 maps
     the square brackets of a control token after steps 1 and 2, so a full-width form, or one with a removed character
-    in it, is caught too, and after step 3, so a secret that holds a control token is removed whole first."""
+    in it, is caught too, and after step 3, so a secret that holds a control token is removed whole first; and once
+    more after step 5, whose markers' brackets run text next to them could complete into a token."""
     text = unicodedata.normalize("NFKC", text)
     text = _unwanted_characters().sub(_without_unwanted, text)
     text = exact.redact(text, counts)  # before the brackets are mapped: a secret may hold '<', '>' or '[INST]'
     text = text.translate(_ANGLES)
     text = _CONTROL_TOKEN.sub(_white_brackets, text)
     text = _FENCE_LOOKALIKE.sub("untrusted-text", text)
-    return redact_patterns(text, counts)
+    text = redact_patterns(text, counts)
+    # A marker of the pattern layer brings square brackets of its own, which run text next to it can complete into a
+    # token of no word ('[e~' before it gives '[e~[', '~b]' after it ']~b]'): so the brackets are mapped once more.
+    return _CONTROL_TOKEN.sub(_white_brackets, text)
 
 
 # What of a long text is cleaned. The digest shows a prefix of each text, and the first and last lines of an output,

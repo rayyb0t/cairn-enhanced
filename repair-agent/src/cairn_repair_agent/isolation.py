@@ -6,6 +6,9 @@ refuses to start unless `--allow-shared-user` turns them into a WARNING.
 
 "Can be opened for reading" means that `os.open(path, os.O_RDONLY | os.O_NONBLOCK)` succeeds; the descriptor is
 closed at once and nothing is read.
+
+`worker_temp_paths_readable` is no reason: the live agent logs what it finds as one WARNING at its start and goes on
+(build step RA2).
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 import errno
 import os
 import pwd
+import re
 import stat
 import sysconfig
 
@@ -170,6 +174,61 @@ def check(config: AgentConfig, config_path: str, settings_file: SettingsFile) ->
     if changeable_by_others(settings_file.path, frozenset({0, root_uid})):
         reasons.append("settings_writable")
     return reasons
+
+
+# Where local workers leave raw run output in the shared /tmp, as the pinned CLIs and Cairn's pi wrapper do it, each
+# made with the default mode, so readable by every local user under umask 022 or 002 (build step RA2): Claude Code's
+# per-user folder, realpath(CLAUDE_CODE_TMPDIR or $TMPDIR or /tmp)/claude-<uid>, which holds the full output of its
+# background jobs; Cairn's pi session folder, /tmp/cairn-pi/<worker>/sessions (workers/adapters/pi.py), which holds
+# pi's whole transcripts; and pi's own spill files, $TMPDIR/pi-bash-<16 hex>.log, the full output of a bash call over
+# 50 KB, which pi keeps. The dispatcher redacts only its copies. Only the defaults under /tmp are checked: the agent
+# cannot see the dispatcher's environment.
+CLAUDE_TEMP_FOLDER = "/tmp/claude-{uid}"
+PI_SESSION_ROOT = "/tmp/cairn-pi"
+PI_SPILL_FILES = re.compile(r"pi-bash-[0-9a-f]{16}\.log")
+PI_SPILL_SHOWN = "/tmp/pi-bash-*.log"
+
+
+def worker_temp_paths_readable(root: str) -> list[str]:
+    """The worker temp folders of the copy root's owner that this process can list, and pi's spill files of that owner
+    in /tmp when it can read one, for the live agent's WARNING at its start (build step RA2). Not an isolation reason:
+    it never refuses a start, and the replay, gate and export tools never call it. Raises nothing: what cannot be
+    examined counts as not readable."""
+    try:
+        owner = os.stat(root).st_uid
+    except (OSError, ValueError):
+        return []
+    found = [folder for folder in (CLAUDE_TEMP_FOLDER.format(uid=owner), PI_SESSION_ROOT) if _can_list(_system(folder))]
+    if _spill_file_readable(_system("/tmp"), owner):
+        found.append(PI_SPILL_SHOWN)
+    return found
+
+
+def _can_list(path: str) -> bool:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK)
+    except (OSError, ValueError):
+        return False
+    os.close(fd)
+    return True
+
+
+def _spill_file_readable(tmp: str, owner: int) -> bool:
+    """Whether `tmp` holds a pi spill file, a regular file of `owner`, that this process can open for reading."""
+    try:
+        with os.scandir(tmp) as entries:
+            for entry in entries:
+                if not PI_SPILL_FILES.fullmatch(entry.name):
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode) and info.st_uid == owner and can_open_for_reading(entry.path):
+                    return True
+    except (OSError, ValueError):
+        return False
+    return False
 
 
 def state_dir_reasons(state_dir: str) -> list[str]:

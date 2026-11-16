@@ -860,7 +860,11 @@ LOG_FORMATS = [
     "repair reviewer settings are writable by the dispatcher's user, local workers can change them path=%s",
     "repair agent settings file readable by others path=%s mode=%s",
     "repair model endpoint is plain http on a non-loopback host endpoint=%s",
+    # Build step RA2: the WARNING for local workers' temporary output, and the class of a poll without an answer.
+    "repair agent can read local workers' temporary output paths=%s; give them private temp folders "
+    "(runbook, host install, step 4 e)",
     "repair agent poll failed status=%s retry_in=%ss",
+    "repair agent poll failed status=0 error=%s retry_in=%ss",
     "repair review started run=%s project=%s intent=%s window=%s elapsed=%ss remaining=%ss cli=%s",
     "repair review skipped run=%s window=%s reason=project_not_listed",
     "repair transcript unavailable run=%s reason=%s",

@@ -2,7 +2,8 @@
 
 The startup, in order: load `repair.yaml`, read the token and the optional server API key, read the dispatcher's
 settings file; run the isolation check, with the state folder's reasons; strip the proxy, CA, netrc and key-log
-variables from the environment; quiet urllib3's logger; log the plain-http and settings-file WARNINGs (§9.3 step 5);
+variables from the environment; quiet urllib3's logger; log the plain-http and settings-file WARNINGs (§9.3 step 5),
+and the WARNING for local workers' temporary output that this user can read, which refuses nothing (build step RA2);
 check the reviewer pin (owner decision O9, `pin.py`), before any client is built; build the server client and the
 first reviewer's model client; log the `repair agent started` line. Every startup failure exits with code 2. Then
 `main` enters the review loop (`loop.run_agent`, §9.3 step 7): until SIGINT or SIGTERM, or for one poll with `--once`.
@@ -117,6 +118,14 @@ def start(args: argparse.Namespace) -> StartedAgent:
             "repair agent settings file readable by others path=%s mode=%s",
             settings_file.path,
             f"{settings_file.mode:04o}",
+        )
+    # Not an isolation reason: a live install must keep starting after an upgrade (build step RA2).
+    readable_temp = isolation.worker_temp_paths_readable(config.transcripts.root)
+    if readable_temp:
+        logger.warning(
+            "repair agent can read local workers' temporary output paths=%s; give them private temp folders "
+            "(runbook, host install, step 4 e)",
+            ",".join(readable_temp),
         )
 
     # The reviewer pin, before any client is built or any request sent (O9): a changed reviewer stops the agent here,
