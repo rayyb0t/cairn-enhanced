@@ -74,6 +74,13 @@ FOLDER_REMEDY = (
     "repair reviewer pin: the agent cannot use its state folder; check state.dir in repair.yaml, and as root make it "
     "the agent's own folder with: install -d -m 0700 -o {user} -g {group} {folder}"
 )
+# Build step RB1: the remedy for a symlinked state folder, which the pin's open refuses; FOLDER_REMEDY's command would
+# follow the link and leave it in place.
+FOLDER_SYMLINK_REMEDY = (
+    "repair reviewer pin: the agent's state folder is a symlink, which it does not follow; check state.dir in "
+    "repair.yaml, and as root replace the link with a folder of the agent's own: rm {folder} && install -d -m 0700 "
+    "-o {user} -g {group} {folder}"
+)
 CA_PEM = "-----BEGIN CERTIFICATE-----\nnot a real certificate\n-----END CERTIFICATE-----\n"
 PROXY = "http://127.0.0.1:3128"
 TEMPORARY = re.compile(r"\.reviewer-pin\.json\.[0-9a-f]{16}\.tmp")
@@ -244,12 +251,14 @@ def test_the_first_start_pins_the_live_reviewer(
         assert secret.encode() not in data
 
     records = records_of(caplog)
+    # Build step RB1: the pinned line also says that a proxy and a CA file are pinned, never their values.
+    pinned_line = f"repair reviewer pinned reviewer=reviewer_pinned endpoint={stub.url} proxy=set ca_bundle=set"
     assert [(level, message) for level, message in records if message.startswith("repair reviewer pinned")] == [
-        ("INFO", f"repair reviewer pinned reviewer=reviewer_pinned endpoint={stub.url}")
+        ("INFO", pinned_line)
     ]
     messages = [message for _, message in records]
     started = next(index for index, message in enumerate(messages) if message.startswith("repair agent started"))
-    assert messages.index(f"repair reviewer pinned reviewer=reviewer_pinned endpoint={stub.url}") < started
+    assert messages.index(pinned_line) < started
     assert messages[started].endswith(f" dry_run={'true' if flags else 'false'}")
     text = "\n".join(messages) + stderr
     for hidden in ("user-canary", "password-canary", "deep-path-canary", PROXY, REVIEWER_KEY, SECOND_REVIEWER_KEY):
@@ -675,9 +684,10 @@ def test_the_state_folder_rules(host_install: HostInstall, case: str) -> None:
     """AG85, in the host install as the agent's user (no other reason holds there): a symlinked, foreign-owned,
     group-writable or world-writable state folder gives its reason, after `settings_writable`, in A3's order, and
     the agent refuses to start. With `--allow-shared-user` the reasons become the WARNING line and the pin still
-    applies: the reviewer is pinned, and a changed reviewer is refused; a folder the agent cannot use stops it. The
-    owner bits are checked for the agent's own folder only: another user's folder whose owner bits lack write, but
-    whose other bits let the agent in, is used."""
+    applies: the reviewer is pinned, and a changed reviewer is refused; a folder the agent cannot use stops it, and so
+    does a symlinked folder, which the pin's open refuses (O_NOFOLLOW, build step RB1). The owner bits are checked for
+    the agent's own folder only: another user's folder whose owner bits lack write, but whose other bits let the agent
+    in, is used."""
     reasons = FOLDER_CASES[case].reasons
     folder = FOLDER_CASES[case].make(host_install.base, f"state-{case}")
     host_install.write_config(state={"dir": str(folder)})
@@ -702,9 +712,21 @@ def test_the_state_folder_rules(host_install: HostInstall, case: str) -> None:
             ),
         ]
         return
+    # Build step RB1: the pin's open (O_NOFOLLOW) refuses a symlinked folder, with the link's own remedy, and nothing
+    # is pinned in its target.
+    if FOLDER_CASES[case].symlink:
+        assert not allowed.started
+        assert allowed.messages("repair reviewer pin") == [
+            f"repair reviewer pin unusable path={pin_file(folder)} reason=unreadable:ENOTDIR",
+            FOLDER_SYMLINK_REMEDY.format(
+                user=_name(pwd.getpwuid, AGENT_UID), group=_name(grp.getgrgid, AGENT_GID), folder=folder
+            ),
+        ]
+        assert not pin_file(folder).exists()
+        return
     assert allowed.started, allowed.text()
     assert allowed.messages("repair reviewer pinned") == [
-        "repair reviewer pinned reviewer=reviewer_local endpoint=http://127.0.0.1:11434"
+        "repair reviewer pinned reviewer=reviewer_local endpoint=http://127.0.0.1:11434 proxy=none ca_bundle=none"
     ]
     assert pin_file(folder).is_file() and os.stat(pin_file(folder)).st_uid == AGENT_UID
     host_install.write_settings(settings_data(reviewers=[reviewer_entry(base_url="http://127.0.0.1:11435/v1")]))
@@ -753,7 +775,7 @@ def test_the_state_folder_rules_come_after_settings_writable(host_install: HostI
         "repair agent running without isolation reasons=settings_writable,state_dir_writable"
     ]
     assert allowed.messages("repair reviewer pinned") == [
-        "repair reviewer pinned reviewer=reviewer_local endpoint=http://127.0.0.1:11434"
+        "repair reviewer pinned reviewer=reviewer_local endpoint=http://127.0.0.1:11434 proxy=none ca_bundle=none"
     ]
 
 
@@ -772,7 +794,8 @@ def test_the_state_folder_rules_as_any_user(case: str, layout: Layout) -> None:
     world-writable state folder of the test's own user gives its reasons (`isolation.state_dir_reasons`), after every
     other reason of the layout, in A3's order. Without `--allow-shared-user` the agent refuses to start and pins
     nothing; with it the reasons are in the WARNING line and the pin still applies: the reviewer is pinned, and a
-    changed reviewer is refused."""
+    changed reviewer is refused, or, for a symlinked folder, the pin's open refuses the link (O_NOFOLLOW, build step
+    RB1) with the link's remedy, and nothing is pinned."""
     mode, symlink, reasons = OWN_FOLDER_CASES[case]
     target = layout.base / f"state-{case}-target"
     target.mkdir()
@@ -798,12 +821,23 @@ def test_the_state_folder_rules_as_any_user(case: str, layout: Layout) -> None:
     ]
     assert not pin_file(folder).exists()
     allowed = layout.start("--allow-shared-user")
-    assert allowed.started, allowed.text()
     assert allowed.messages("repair agent running without isolation") == [
         f"repair agent running without isolation reasons={','.join([*others, *reasons])}"
     ]
+    # Build step RB1: the pin's open (O_NOFOLLOW) refuses a symlinked folder, with the link's own remedy, and nothing
+    # is pinned in its target.
+    if symlink:
+        assert not allowed.started
+        user, group = _name(pwd.getpwuid, os.geteuid()), _name(grp.getgrgid, os.getegid())
+        assert allowed.messages("repair reviewer pin") == [
+            f"repair reviewer pin unusable path={pin_file(folder)} reason=unreadable:ENOTDIR",
+            FOLDER_SYMLINK_REMEDY.format(user=user, group=group, folder=folder),
+        ]
+        assert not pin_file(target).exists()
+        return
+    assert allowed.started, allowed.text()
     assert allowed.messages("repair reviewer pinned") == [
-        "repair reviewer pinned reviewer=reviewer_local endpoint=http://127.0.0.1:11434"
+        "repair reviewer pinned reviewer=reviewer_local endpoint=http://127.0.0.1:11434 proxy=none ca_bundle=none"
     ]
     assert pin_file(target).is_file()
     layout.write_settings(settings_data(reviewers=[reviewer_entry(base_url="http://127.0.0.1:11435/v1")]))

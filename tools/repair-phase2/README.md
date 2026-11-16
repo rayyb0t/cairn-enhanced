@@ -262,7 +262,9 @@ address, as a model server on the host must (Compose notes).
 
 The agent reviews live runs with the first entry; the gate replay runs every entry on the same cases.
 Once the gate has passed, put first the reviewer that passed, a local one if both did, and restart
-the dispatcher, then the agent (step 4).
+the dispatcher, then the agent (step 4). If that changes the first reviewer, the agent then refuses
+to start, because its first reviewer changed since it was pinned: accept the change as step 4's
+"Accepting a reviewer change" says (remove the pin file as root, then start the agent).
 
 - **Host:** create the `cairn-repair` user, the copy root and your membership of its group first
   (step 4 a and b), then start the dispatcher from a new login:
@@ -566,13 +568,28 @@ anything.
 **The reviewer pin** limits what such a change can do. At its first start the agent remembers its
 reviewer, the first entry of the `repair:` section: its name, address (`REVIEW_BASE_URL`), format
 (`api_format`), model, `proxy` and `ca_bundle`, in `/var/lib/cairn-repair/state/reviewer-pin.json`
-(step 4 b), a file only `cairn-repair` and root can change. It logs
+(step 4 b), a file only `cairn-repair` and root can change. It logs the reviewer's name, the
+`scheme://host:port` of its address, and whether a proxy and a CA file are pinned (`set` or `none`,
+never their values):
 
 ```
-repair reviewer pinned reviewer=reviewer_claude endpoint=https://api.anthropic.com:443
+repair reviewer pinned reviewer=reviewer_claude endpoint=https://api.anthropic.com:443 proxy=none ca_bundle=none
 ```
 
-and at every later start it compares the reviewer with the pin. If any of these six changed, it
+That first start trusts whatever reviewer the settings file names at that moment, on a fresh install
+as after an upgrade or an accepted change. A local worker can change the `repair:` section of
+`dispatch.yaml` as well as the settings file, so before you rely on the pin, check it against what you
+set up yourself (the address your provider or your model server gives you), not only against
+`dispatch.yaml`. The line shows no path of the address, no proxy URL and no CA file's path; the pin
+file holds all six as they were written (and no key), so read it as root:
+
+```bash
+sudo cat /var/lib/cairn-repair/state/reviewer-pin.json
+```
+
+In Compose, read it in the agent's volume with
+`docker compose -f docker-compose.yaml -f docker-compose.repair.yaml run --rm --no-deps --entrypoint cat cairn-repair /var/lib/cairn-repair/state/reviewer-pin.json`.
+At every later start the agent compares the reviewer with the pin. If any of these six changed, it
 refuses to start instead of sending a digest anywhere new (see "Accepting a reviewer change" below).
 So a worker that points the reviewer at a listener of its own stops the agent rather than
 redirecting it. The pin's limits: it stops a worker from redirecting the live agent's reviewer. It
@@ -629,7 +646,7 @@ start with `agent settings missing: …` (start the dispatcher with its `repair:
 | `secret_writable` | `agent.token` can be changed by another user (step 4 d). |
 | `package_writable` | The agent's code can be changed by another user: repeat step 4 c's `chown` and `chmod`. |
 | `settings_writable` | `agent-settings.json` belongs to someone other than you or root, or is group- or world-writable. The dispatcher writes it 0640; do not change it by hand. |
-| `state_dir_symlink` | The state folder (`state.dir`, `/var/lib/cairn-repair/state`) is a symlink: make it a real folder (step 4 b). |
+| `state_dir_symlink` | The state folder (`state.dir`, `/var/lib/cairn-repair/state`) is a symlink, which the agent does not follow. Replace the link with a folder of the agent's own: `sudo rm /var/lib/cairn-repair/state && sudo install -d -m 0700 -o cairn-repair -g cairn-repair /var/lib/cairn-repair/state` (step 4 b's line alone would follow the link and leave it in place; `rm` removes the link, not the folder it names), or set `state.dir` to a real folder of the agent's own. In a new, empty folder the next start pins the reviewer anew: check the pinned line as for a first start (step 4 f, "The reviewer pin"). |
 | `state_dir_owner` | The state folder is not owned by the agent's user: `sudo chown cairn-repair:cairn-repair /var/lib/cairn-repair/state`. In Compose it is root's, which `up -d --build` sets up for the agent, root there; a non-root agent needs a folder of its own instead of the volume (Compose notes, "A non-root agent"). |
 | `state_dir_writable` | The state folder is group- or world-writable: `sudo chmod 0700 /var/lib/cairn-repair/state`. |
 
@@ -641,7 +658,7 @@ agent cannot use, which gets the folder's own remedy (below):
 | Line | What to fix |
 | --- | --- |
 | `repair reviewer changed since it was pinned fields=<fields> pin=<path>` | The named fields of the first reviewer differ from the pin (never their values). See "Accepting a reviewer change" below. |
-| `repair reviewer pin unusable path=<path> reason=<reason>` | The pin cannot be used. `folder_missing`: the state folder does not exist; the line names the `install -d -m 0700 …` command that creates it, which you run as root (step 4 b). `not_a_regular_file` (a symlink, a FIFO or a folder in its place), `owner_or_mode` (not the agent user's own, or group- or world-writable), `too_large` (over 64 KiB), `malformed` (not UTF-8 JSON of the pin's shape), `wrong_version` and `unreadable:<errno>`: something other than the agent wrote it; look at it, then remove it as root. `unreadable:<errno>` for the state folder itself, which is there but not a folder the agent can use (`EACCES`: another user's, or the agent user's own with a mode that does not give that user read, search and write, such as 0600 or 0500, which the agent checks before it reads or writes the pin; `ENOTDIR`: `state.dir` names a file): the second line is `repair reviewer pin: the agent cannot use its state folder; check state.dir in repair.yaml, and as root make it the agent's own folder with: install -d -m 0700 -o <user> -g <group> <state.dir>`, whose command also sets the owner and mode of a folder that is there. `write_failed`: the agent could not write the pin, for example on a full disk, and left no partial file. |
+| `repair reviewer pin unusable path=<path> reason=<reason>` | The pin cannot be used. `folder_missing`: the state folder does not exist; the line names the `install -d -m 0700 …` command that creates it, which you run as root (step 4 b). `not_a_regular_file` (a symlink, a FIFO or a folder in its place), `owner_or_mode` (not the agent user's own, or group- or world-writable), `too_large` (over 64 KiB), `malformed` (not UTF-8 JSON of the pin's shape), `wrong_version` and `unreadable:<errno>`: something other than the agent wrote it; look at it, then remove it as root. `unreadable:<errno>` for the state folder itself, which is there but not a folder the agent can use (`EACCES`: another user's, or the agent user's own with a mode that does not give that user read, search and write, such as 0600 or 0500, which the agent checks before it reads or writes the pin; `ENOTDIR`: `state.dir` names a file, or a symlink, which the agent does not follow): the second line is `repair reviewer pin: the agent cannot use its state folder; check state.dir in repair.yaml, and as root make it the agent's own folder with: install -d -m 0700 -o <user> -g <group> <state.dir>`, whose command also sets the owner and mode of a folder that is there. For a symlink it is `repair reviewer pin: the agent's state folder is a symlink, which it does not follow; check state.dir in repair.yaml, and as root replace the link with a folder of the agent's own: rm <state.dir> && install -d -m 0700 -o <user> -g <group> <state.dir>`, two commands to run as root (`install -d` alone would follow the link and leave it in place; `rm` removes the link, not the folder it names), or set `state.dir` to a real folder of the agent's own. `write_failed`: the agent could not write the pin, for example on a full disk, and left no partial file. |
 
 ### Accepting a reviewer change
 
@@ -658,7 +675,8 @@ restarting the dispatcher (step 4):
   docker compose -f docker-compose.yaml -f docker-compose.repair.yaml up -d cairn-repair
   ```
 
-The next start pins the new reviewer and logs `repair reviewer pinned …`. A change you did not make
+The next start pins the new reviewer and logs `repair reviewer pinned …`: check what it pinned as for
+a first start (step 4 f, "The reviewer pin"). A change you did not make
 means a worker or another process changed the reviewer: before you remove anything, look at the
 `repair:` section of `dispatch.yaml` and at the settings file, `agent-settings.json` in the copy root.
 `max_tokens`, `timeout_seconds`, `max_attempts`, `context_window`, `structured_output`, a reviewer's
@@ -666,18 +684,104 @@ key and every other reviewer are not pinned: changing them never needs the pin r
 
 ### Upgrading from an earlier Phase 2 build
 
-The agent now needs its state folder. On a host, create it (step 4 b's
-`sudo install -d -m 0700 -o cairn-repair -g cairn-repair /var/lib/cairn-repair/state`) before you
-start the new agent; without it, the agent stops with `repair reviewer pin unusable … reason=folder_missing`.
+The agent pins its reviewer in a state folder of its own; builds before the reviewer pin had none. On
+a host, after you update your checkout, run these from it, in this order:
+
+**1. Stop the agent:** Ctrl-C, or `sudo systemctl stop cairn-repair` if it runs from step 4 f's
+systemd unit.
+
+**2. Repeat step 4 c in full.** The agent runs from its copy in `/opt/cairn-repair`, not from your
+checkout: without this step the earlier agent keeps running (from a build before the reviewer pin:
+with no pin, no `repair reviewer pinned` line and the earlier `max_tokens` default). Remove the
+previous copy, copy, make it root's, install as root, and make it root's again, exactly as step 4 c
+does:
+
+```bash
+sudo rm -r /opt/cairn-repair/src /opt/cairn-repair/tools/repair-phase2
+sudo install -d -m 0755 /opt/cairn-repair /opt/cairn-repair/tools
+sudo cp -r repair-agent/pyproject.toml repair-agent/uv.lock repair-agent/src /opt/cairn-repair/
+sudo cp -r tools/repair-phase2 /opt/cairn-repair/tools/
+sudo chown -R root:root /opt/cairn-repair
+sudo chmod -R u=rwX,go=rX /opt/cairn-repair
+sudo -H sh -c 'cd /opt/cairn-repair && UV_PYTHON_INSTALL_DIR=/opt/cairn-repair/python /usr/local/bin/uv sync --frozen --no-dev'
+sudo chown -R root:root /opt/cairn-repair
+sudo chmod -R u=rwX,go=rX /opt/cairn-repair
+```
+
+**3. Create the state folder** (step 4 b's line; on a folder that is there already, it only sets its
+owner and mode):
+
+```bash
+sudo install -d -m 0700 -o cairn-repair -g cairn-repair /var/lib/cairn-repair/state
+```
+
+Without it, the new agent stops with `repair reviewer pin unusable … reason=folder_missing`. `state.dir`
+defaults to this folder, so a `repair.yaml` from an earlier build needs no new key; if yours sets the
+other paths explicitly, name it too, as `repair.example.yaml` does (step 4 d): with
+`sudoedit /etc/cairn-repair/repair.yaml`, add a `state:` section beside `transcripts:`:
+
+```yaml
+state:
+  dir: "/var/lib/cairn-repair/state"
+```
+
+Write it as a section, as above: a single line `state.dir: …` is a key of its own, which the agent
+refuses at its start as unknown (`agent config invalid: … state.dir: unknown key`). A `dir` that ends
+in `/` or holds a `.` or `..` component, which a build before this one accepted, is refused too
+(`agent config invalid: … state.dir: must not end in / or hold a . or .. component`): write the
+folder's own path, as above.
+
+**4. Restart the dispatcher** (step 3), so that it runs this build's code too (it now also removes
+header secrets from the copies), and wait for its `repair shadow agent settings written` line. In local
+mode, first give your local workers private temporary folders and restart the dispatcher from the
+shell that has the exports, as step 4 e says ("Local mode: your workers' temporary output"); without
+them, the agent logs a WARNING at its start while it can read their temporary output (Check), and
+starts all the same.
+
+**5. Start the agent** (step 4 f, or `sudo systemctl start cairn-repair`).
+
+**6. Check the pin.** From a build before the reviewer pin, this first start pins the reviewer that the
+settings file names at that moment, as on a fresh install, and logs
+`repair reviewer pinned reviewer=<name> endpoint=<scheme://host:port> proxy=<set|none> ca_bundle=<set|none>`.
+From a build that already pins (`/var/lib/cairn-repair/state/reviewer-pin.json` was there before this
+start), the agent keeps that pin: a start whose reviewer matches it logs no pinned line, and one whose
+reviewer differs refuses to start ("Accepting a reviewer change"). Either way, before you rely on the
+pin, read it as root and compare it with the reviewer you set up yourself, as step 4 f says ("The
+reviewer pin"): the address your provider or your model server gives you, not only the `repair:`
+section of `dispatch.yaml`, which a local worker can change too:
+
+```bash
+sudo cat /var/lib/cairn-repair/state/reviewer-pin.json
+```
+
+If it is not your reviewer, a worker or another process changed it: stop the agent, look at the
+`repair:` section and at the settings file, put your own reviewer back, and accept it as in "Accepting
+a reviewer change".
+
 In Compose, `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml up -d --build`
-creates the `cairn-repair-state` volume (a non-root agent needs its own folder first: Compose notes).
-The first start then logs `repair reviewer pinned …`. A
-reviewer that leaves `max_tokens` out now gets 16384 rather than 4096, or less with `context_window`
-(step 3). An earlier agent refuses the `state:` key of this build's `repair.yaml` as unknown: to go
-back to an earlier build, remove that key from `repair.yaml` first. On a host in local mode, the agent
-now also logs a WARNING at its start while it can read your local workers' temporary output (Check);
-give them private temp folders as step 4 e says, then restart the dispatcher from a shell that has the
-exports.
+rebuilds the agent's image, creates the `cairn-repair-state` volume if it is not there yet and starts
+the new agent; check its pin as in 6: from a build before the reviewer pin, its pinned line is in
+`docker compose -f docker-compose.yaml -f docker-compose.repair.yaml logs cairn-repair`, and you read
+the pin with
+`docker compose -f docker-compose.yaml -f docker-compose.repair.yaml run --rm --no-deps --entrypoint cat cairn-repair /var/lib/cairn-repair/state/reviewer-pin.json`.
+A non-root agent (Compose notes) run from a copy of the override made before the reviewer pin needs its
+own state folder first, and that copy has neither a `cairn-repair-state` line to replace nor a
+`./datas/repair-state` line: add the line `- ./datas/repair-state:/var/lib/cairn-repair/state` to the
+`volumes:` of `cairn-repair` in your copy, create the folder for the agent's user, then start with
+your copy in place of `docker-compose.repair.yaml`:
+
+```bash
+sudo install -d -m 0700 -o <uid> -g <gid> datas/repair-state
+docker compose -f docker-compose.yaml -f <your copy of the override> up -d --build
+```
+
+Without the line and the folder, the agent stops with
+`repair agent isolation check failed reasons=state_dir_owner`, and Compose starts it again and again.
+
+From a build before the reviewer pin, a reviewer that leaves `max_tokens` out now gets 16384 rather
+than 4096, or less with `context_window` (step 3). An agent from before the reviewer pin refuses the
+`state:` key of this build's `repair.yaml` as unknown: to go back to such a build, remove that key
+from `repair.yaml` first (step 9).
 
 ## 5. Switch on
 
@@ -725,14 +829,22 @@ settings file at each start and removes the copies of projects you delete. To st
 those runs have ended:
 
 - **Host:** remove the section from `dispatch.yaml`, restart the dispatcher, and delete
-  `/var/lib/cairn-repair/transcripts/agent-settings.json`, which holds the reviewers' keys.
+  `/var/lib/cairn-repair/transcripts/agent-settings.json`, which holds the reviewers' keys. Then
+  delete the agent's state folder, with its reviewer pin: `sudo rm -r /var/lib/cairn-repair/state`
+  (step 4 b creates it again).
 - **Compose:** remove the section from `./dispatch.yaml`, run
   `docker compose -f docker-compose.yaml up -d --remove-orphans`, which recreates the server and the
   dispatcher without the override and removes the agent's container, then delete
-  `datas/repair-transcripts/agent-settings.json` with `sudo` (it belongs to root).
+  `datas/repair-transcripts/agent-settings.json` with `sudo` (it belongs to root). Then, with the
+  agent's container gone, remove its state volume, with its reviewer pin:
+  `docker volume rm <project>_cairn-repair-state`, where `<project>` is the Compose project's name, by
+  default the name of your checkout's folder (`docker volume ls` lists the volume). For a non-root
+  agent, delete its folder instead: `sudo rm -r datas/repair-state`.
 
-Copies left in the copy root then stay until you delete them. Deleting a project deletes its repair
-rows in the same transaction, whether Repair runs or not.
+The reviewer pin holds no key, but it keeps the first reviewer's name, address, format, model, proxy
+URL and CA file path as they were written, a user name and password in the address or the proxy URL
+included. Copies left in the copy root then stay until you delete them. Deleting a project deletes
+its repair rows in the same transaction, whether Repair runs or not.
 
 ## 8. Removal
 
@@ -744,6 +856,12 @@ start if it was down; and when a completed project's container or work folder is
 the copies stay, as the container or folder does, until you delete the project. There is no
 time-based retention and no cron job.
 
+The agent's reviewer pin belongs to no project, so deleting a project leaves it: it stays in the
+agent's state folder (`/var/lib/cairn-repair/state` on a host, the `cairn-repair-state` volume in
+Compose) until you delete that folder or volume (step 7). It holds no key, but it keeps the first
+reviewer's name, address, model and proxy URL as they were written, a user name and password in the
+address or the proxy URL included.
+
 ## 9. Rollback
 
 The previous server runs unchanged on a migrated database: it ignores the new column and tables, and
@@ -751,12 +869,16 @@ it still deletes a project's repair rows with the project, because the foreign k
 table in the database file. A previous dispatcher ignores the switch, but refuses a `dispatch.yaml`
 that has a `repair:` section: remove the section, its `repair:` line included, before you start it.
 Started with the section still there, its error prints the section's first 25 and last 24 characters:
-with step 3's order, no reviewer's key is among them. Nothing needs to be dropped.
+with step 3's order, no reviewer's key is among them. An agent from before the reviewer pin refuses
+the `state:` key of this build's `repair.yaml` (`repair.compose.yaml` in Compose) as unknown: remove
+that key before you start it ("Upgrading from an earlier Phase 2 build"). Nothing needs to be dropped.
 
-The repair tables keep the digests and raw model output (target data) of the projects you keep, and
-the copy root keeps their copies and `agent-settings.json`, which holds the reviewers' keys. If you do
-not want to keep them, delete the copy root's contents, and stop the server and drop both tables,
-before or after you check out the previous version:
+The repair tables keep the digests and raw model output (target data) of the projects you keep, the
+copy root keeps their copies and `agent-settings.json`, which holds the reviewers' keys, and the
+agent's state folder keeps its reviewer pin, with the first reviewer's name, address, model and proxy
+URL as they were written. If you do not want to keep them, delete the copy root's contents and the
+agent's state folder or volume (step 7), and stop the server and drop both tables, before or after
+you check out the previous version:
 
 ```bash
 python3 -c "import sqlite3; c = sqlite3.connect('file:<database>?mode=rw', uri=True); c.executescript('DROP TABLE IF EXISTS repair_reviews; DROP TABLE IF EXISTS repair_runs;')"
@@ -796,8 +918,10 @@ root's contents, with `sudo`). A Phase 2 server started on that file again creat
   repair-agent/src`), because the image keeps their mode bits and only removes write permission.
   It also needs a state folder of its own, where it pins its reviewer: in your copy of the override,
   replace the line of the `cairn-repair-state` volume with
-  `- ./datas/repair-state:/var/lib/cairn-repair/state`, and before the first `up` create that folder
-  for that user: `sudo install -d -m 0700 -o <uid> -g <gid> datas/repair-state`. The named volume
+  `- ./datas/repair-state:/var/lib/cairn-repair/state` (a copy made before the reviewer pin has no
+  such line: add this one to the `volumes:` of `cairn-repair`, as "Upgrading from an earlier Phase 2
+  build" says), and before the first `up` create that folder for that user:
+  `sudo install -d -m 0700 -o <uid> -g <gid> datas/repair-state`. The named volume
   does not work for a non-root agent, even after a `chown`: whenever a container mounts it while it
   is empty, as it is until the agent's first pin, Docker gives it the owner and mode of the image's
   folder again, root's and 0700, so the agent would stop with `state_dir_owner`.

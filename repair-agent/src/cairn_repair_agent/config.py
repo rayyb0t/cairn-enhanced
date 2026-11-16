@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import stat
+import string
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
@@ -69,6 +70,13 @@ OPENAI_CHAT = "openai_chat"
 ANTHROPIC_MESSAGES = "anthropic_messages"
 ApiFormat = Literal["openai_chat", "anthropic_messages"]
 
+# The characters of a URL's host that RFC 3986 allows (unreserved, pct-encoded, sub-delims, and the colons of an IPv6
+# literal). requests percent-encodes the other printable ones a host can hold (`"`, `^`, a backquote, `{`, `|`, `}`:
+# requests 2.34.2 `utils.requote_uri`) when it prepares a request, so its connection pool would take another name
+# than the endpoint shown (build step RB1). Of these it changes only a percent escape: one that `parse_url` decodes
+# in a host too, which `_read_otherwise_by_requests` compares, or one in an IPv6 zone id, which it refuses. A host
+# that starts with `*` requests refuses outright, and so does `url_problem`.
+HOST_CHARACTERS = frozenset(string.ascii_letters + string.digits + "-._~%!$&'()*+,;=:")
 REVIEWER_NAME_RULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 ENV_NAME_RULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 # A key that a message may name; any other key (it comes from the file) is printed as "other".
@@ -173,13 +181,28 @@ def _rule(text: str) -> PydanticCustomError:
 def url_problem(value: str) -> str | None:
     """Why `value` is not an http:// or https:// URL with a host and a valid port; None when it is one. A host with an
     empty label (`a..b`) or a label over 63 characters is refused: urllib3 cannot encode it, so every request to it
-    would fail, and the server client's polls with it."""
+    would fail, and the server client's polls with it. So is a host that starts with `*` (the review of build step
+    RB1), to which requests prepares no request (`URL has an invalid label.`: requests 2.34.2
+    `PreparedRequest.prepare_url`, which refuses a host that starts with `.` too, an empty label here); as the
+    empty-label rule does, this one holds for a proxy's host as well, whose literal name requests would ask the
+    resolver for.
+
+    So is a URL that the two parsers read differently (build step RB1): urllib.parse, with which the agent shows an
+    endpoint (`model.endpoint_of`), tests it for plain http to a host that is not loopback, and pins it, and urllib3's
+    `parse_url`, with which requests prepares every request and so chooses the host it connects to. A backslash, which
+    urllib3 takes for the end of the host and urllib.parse does not, is refused by itself, and any URL whose scheme,
+    host or port the two read differently, or that `parse_url` cannot read, or whose host holds a character that
+    requests percent-encodes when it prepares the request (`HOST_CHARACTERS`) or an IPv6 zone id, whose escapes
+    requests reads differently. So for every URL accepted here, the endpoint the agent shows names the scheme, host
+    and port that requests connects to (the host in any letter case, a percent escape's hex digits included)."""
     if "<" in value or ">" in value:
         return "still holds a <...> placeholder"
     if not value.startswith(("http://", "https://")):
         return "must start with http:// or https://"
     if not is_printable_ascii(value) or " " in value:
         return "must be printable ASCII without spaces"
+    if "\\" in value:
+        return "must not contain a backslash"
     try:
         parts = urlsplit(value)
         port = parts.port
@@ -191,8 +214,40 @@ def url_problem(value: str) -> str | None:
         parts.hostname.encode("idna")
     except UnicodeError:
         return "has a host with an empty label or a label over 63 characters"
+    if parts.hostname.startswith("*"):
+        return "has a host that starts with *"
     if port is not None and not 1 <= port <= 65535:
         return "has a port outside 1-65535"
+    return _read_otherwise_by_requests(value, parts.scheme, parts.hostname, port)
+
+
+def _read_otherwise_by_requests(value: str, scheme: str, host: str, port: int | None) -> str | None:
+    """Why requests would not connect to the scheme, host and port that urllib.parse reads in `value`; None when
+    urllib3's `parse_url` reads the same scheme, the same host in any letter case (an IPv6 literal without its
+    brackets) and the same port (None for both when the URL has none), and the host holds only `HOST_CHARACTERS` and,
+    when it is an IPv6 literal, no zone id.
+
+    urllib3 is imported here, at the first check, not with this module, so the agent's startup first loads it while
+    it validates the settings file (§9.3 step 1), before its environment guard (step 3); requests is still imported
+    only after the guard. That is safe: importing urllib3 and calling `parse_url` read no environment variable and
+    make no connection, session or TLS context. urllib3 reads `SSLKEYLOGFILE` only when it makes a TLS context
+    (`create_urllib3_context`), for a client, which the agent builds only after the guard."""
+    from urllib3.util import parse_url
+
+    try:
+        theirs = parse_url(value)
+    except ValueError:  # urllib3's LocationParseError, a ValueError: requests could not prepare a request to it
+        return "has a host or port that requests cannot read"
+    their_host = theirs.host or ""
+    if their_host.startswith("[") and their_host.endswith("]"):
+        their_host = their_host[1:-1]
+    if (theirs.scheme, their_host.lower(), theirs.port) != (scheme.lower(), host.lower(), port):
+        return "has a scheme, host or port that requests reads differently"
+    # A character that requests percent-encodes, or an IPv6 literal's zone id (`[fe80::1%eth0]`, `[2001:db8::1%31]`),
+    # which requests re-encodes or decodes (`unquote_unreserved`) and `parse_url` does not: the connection pool would
+    # take another name or address than the one shown (2001:db8::11 for the second).
+    if not HOST_CHARACTERS.issuperset(host) or (":" in host and "%" in host):
+        return "has a scheme, host or port that requests reads differently"
     return None
 
 
@@ -208,6 +263,16 @@ def _absolute_path(value: str) -> str:
     _path(value)
     if not os.path.isabs(value):
         raise _rule("must be an absolute path")
+    return value
+
+
+def _state_dir(value: str) -> str:
+    """repair.yaml's `state.dir` (build step RB1): an absolute path, as the file's other paths, that ends in the
+    folder's own name. With a trailing `/`, or a `.` or `..` component, `os.lstat` in the isolation check and the
+    pin's open would look at what a symlinked folder points to, not at the link."""
+    _absolute_path(value)
+    if value.endswith("/") or any(part in (".", "..") for part in value.split("/")):
+        raise _rule("must not end in / or hold a . or .. component")
     return value
 
 
@@ -256,6 +321,7 @@ def _api_key(value: str) -> str:
 
 PathText = Annotated[StrictStr, AfterValidator(_path)]
 AbsolutePathText = Annotated[StrictStr, AfterValidator(_absolute_path)]
+StateDirText = Annotated[StrictStr, AfterValidator(_state_dir)]
 EnvName = Annotated[StrictStr, AfterValidator(_env_name)]
 PositiveInt = Annotated[StrictInt, Field(ge=1)]
 Money = Annotated[StrictFloat, Field(ge=0, allow_inf_nan=False)]
@@ -291,9 +357,10 @@ DEFAULT_STATE_DIR = "/var/lib/cairn-repair/state"
 class StateConfig(_Model):
     """The live agent's state folder, which holds the reviewer pin (owner decision O9, `pin.py`). It is only named
     here: the live agent checks it at its start (`isolation.state_dir_reasons`, `pin.check_reviewer_pin`), and the
-    replay and the gate tools, which read this file too, never touch it."""
+    replay and the gate tools, which read this file too, never touch it. Its path ends in the folder's own name
+    (`_state_dir`), so that the isolation check's `os.lstat` sees a symlinked folder."""
 
-    dir: AbsolutePathText = DEFAULT_STATE_DIR
+    dir: StateDirText = DEFAULT_STATE_DIR
 
 
 class AgentConfig(_Model):

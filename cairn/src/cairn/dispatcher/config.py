@@ -230,6 +230,9 @@ class RepairReviewerEnv(BaseModel):
     def validate_base_url(cls, value: str) -> str:
         if not value.startswith(("http://", "https://")):
             raise ValueError("REVIEW_BASE_URL must start with http:// or https://")
+        # The agent's parser and requests' would read another host in it (build step RB1); the agent refuses it too.
+        if "\\" in value:
+            raise ValueError("REVIEW_BASE_URL must not contain a backslash")
         return value
 
     @field_validator("REVIEW_API_KEY", mode="before")

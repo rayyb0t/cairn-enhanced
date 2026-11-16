@@ -1188,7 +1188,7 @@ repair:                                   # 可选；不写时即今天的 Dispa
 | --- | --- | --- |
 | `name` | 必填；整串匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`（`re.fullmatch`）；评审模型之间唯一 | 在日志与回放报告中标识该评审模型 |
 | `env.REVIEW_MODEL` | 必填，非空 | 发送给端点的模型名。修复代理在启动时按其规则检查（至多 100 个字符，不含空白、`<` 或 `>`） |
-| `env.REVIEW_BASE_URL` | 必填；以 `http://` 或 `https://` 开头 | 端点的 base URL（按修复代理访问到的地址），调用的路径追加在它后面：`openai_chat` 追加 `/chat/completions`，因此写 OpenAI 兼容的 base URL，如 `https://<your provider>/v1`（Compose 中宿主机上的模型服务为 `http://host.docker.internal:<port>/v1`）；`anthropic_messages` 追加 `/v1/messages`，因此不带 `/v1`，写作 `https://api.anthropic.com` |
+| `env.REVIEW_BASE_URL` | 必填；以 `http://` 或 `https://` 开头，不含反斜杠（urllib3 把反斜杠当作主机的结尾，`urllib.parse` 则不然，两者会读出不同的主机；修复代理也在启动时拒绝它） | 端点的 base URL（按修复代理访问到的地址），调用的路径追加在它后面：`openai_chat` 追加 `/chat/completions`，因此写 OpenAI 兼容的 base URL，如 `https://<your provider>/v1`（Compose 中宿主机上的模型服务为 `http://host.docker.internal:<port>/v1`）；`anthropic_messages` 追加 `/v1/messages`，因此不带 `/v1`，写作 `https://api.anthropic.com` |
 | `env.REVIEW_API_KEY` | 可选；去掉首尾的 ASCII 空白（与令牌相同），之后为空即等同于不写；必须是可打印 ASCII | 评审模型自己的 key，只在这里填写，只发送给 `REVIEW_BASE_URL`：`openai_chat` 以 `Authorization: Bearer <key>` 发送，`anthropic_messages` 以 `x-api-key: <key>` 发送（该格式必须有 key）。没有认证的本地服务可以不写。设置文件、共用 key 检查与副本脱敏都使用去掉空白后、即实际发送的 key |
 | `api_format` | 可选；`openai_chat` 或 `anthropic_messages`；不写或 null 为 `openai_chat` | 调用的线上格式。`openai_chat`（默认）：OpenAI 兼容的 chat completions，适用于任何 OpenAI 兼容的端点，托管服务或本地服务都可以。`anthropic_messages`：Claude Messages API，适用于 Claude API key。Dispatcher 只检查取值是这两者之一；`anthropic_messages` 的评审模型没有 `REVIEW_API_KEY`，或设置了 `structured_output: true`，由修复代理在启动时拒绝，因此这类错误只会让修复代理停止，从不让 Dispatcher 停止 |
 | `structured_output`、`max_tokens`、`context_window`、`timeout_seconds`、`max_attempts`、`ca_bundle`、`proxy`、`price` | 可选。`structured_output` 为布尔值；`max_tokens`、`context_window`、`timeout_seconds` 与 `max_attempts` 为 ≥ 1 的整数；`ca_bundle` 与 `proxy` 为非空字符串；`price` 为恰好含 `input_per_mtok` 与 `output_per_mtok` 两个键的对象，各为 ≥ 0 的有限数 | 修复代理模型客户端的设置，含义与默认值见 `docs/specs/repair-agent.md`。不写或为 null 时修复代理取默认值。Dispatcher 只检查这些类型与 `price` 的两个键，取值由修复代理在启动时检查，它不接受的值会让它拒绝启动 |
@@ -1409,7 +1409,7 @@ ERROR   repair module unavailable, running today's explore task project=%s      
 | `repair.reviewers` | 是 | 评审模型列表，至少一个；在线修复代理使用第一个，门禁回放逐个运行 |
 | `repair.reviewers[].name` | 是 | 评审模型名，整串匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`，评审模型之间唯一 |
 | `repair.reviewers[].env.REVIEW_MODEL` | 是 | 发送给端点的模型名 |
-| `repair.reviewers[].env.REVIEW_BASE_URL` | 是 | 以 `http://` 或 `https://` 开头的 base URL；`openai_chat` 追加 `/chat/completions`，`anthropic_messages` 追加 `/v1/messages` |
+| `repair.reviewers[].env.REVIEW_BASE_URL` | 是 | 以 `http://` 或 `https://` 开头、不含反斜杠的 base URL；`openai_chat` 追加 `/chat/completions`，`anthropic_messages` 追加 `/v1/messages` |
 | `repair.reviewers[].env.REVIEW_API_KEY` | 否 | 评审模型自己的 key（`anthropic_messages` 必填）；去掉首尾的 ASCII 空白，可打印 ASCII |
 | `repair.reviewers[].api_format` | 否 | `openai_chat`（默认）或 `anthropic_messages` |
 | `repair.reviewers[].structured_output` | 否 | 布尔值，修复代理默认 true；只用于 `openai_chat` |

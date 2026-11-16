@@ -847,7 +847,7 @@ LOG_FORMATS = [
     "transcripts=%s dry_run=%s",
     "repair agent isolation check failed reasons=%s",
     "repair agent running without isolation reasons=%s",
-    "repair reviewer pinned reviewer=%s endpoint=%s",
+    "repair reviewer pinned reviewer=%s endpoint=%s proxy=%s ca_bundle=%s",
     "repair reviewer changed since it was pinned fields=%s pin=%s",
     "repair reviewer pin unusable path=%s reason=%s",
     "repair reviewer pin unusable path=%s reason=folder_missing; as root, create the folder with: install -d -m 0700 "
@@ -855,6 +855,9 @@ LOG_FORMATS = [
     "repair reviewer pin: if you changed the reviewer yourself, remove the pin file as root and start the agent again",
     "repair reviewer pin: the agent cannot use its state folder; check state.dir in repair.yaml, and as root make it "
     "the agent's own folder with: install -d -m 0700 -o %s -g %s %s",
+    "repair reviewer pin: the agent's state folder is a symlink, which it does not follow; check state.dir in "
+    "repair.yaml, and as root replace the link with a folder of the agent's own: rm %s && install -d -m 0700 -o %s "
+    "-g %s %s",
     "repair agent ignored environment variables names=%s",
     "repair agent token file readable by others file=%s mode=%s",
     "repair reviewer settings are writable by the dispatcher's user, local workers can change them path=%s",

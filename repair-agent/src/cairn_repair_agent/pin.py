@@ -14,17 +14,23 @@ the agent instead of redirecting it.
   here before the pin is read or written), the file 0600, written atomically (a temporary file created with
   O_EXCL | O_NOFOLLOW, fsync, `os.replace`, fsync of the folder), read with O_NOFOLLOW | O_NONBLOCK, checked on its
   descriptor (a regular file of the agent's own, neither group- nor world-writable, at most 64 KiB), and parsed once
-  inside a guard.
+  inside a guard. The folder itself is opened with O_NOFOLLOW too (build step RB1), so a symlinked state folder is
+  refused here even where the isolation check's `state_dir_symlink` was waived (`--allow-shared-user`).
 - When: at the live agent's start only (`cli.start`), after the isolation check and the settings file's WARNINGs, and
   before any client is built or any request sent; with `--dry-run` and `--once` too. The replay and the gate tools
   never touch the state folder.
 
 No line holds the key, a proxy URL, or more of `base_url` than `scheme://host:port`, and a refusal names the changed
-fields, never a value. Every refusal is logged here and raised as a StartupError with `logged=True`: exit code 2. Its
-second line gives the remedy: remove the pin file as root (REMEDY), or, when the agent cannot use the state folder
+fields, never a value. The pinned line also says whether a proxy and a CA file are pinned (`set` or `none`, never the
+value: a proxy URL can hold a user name and password; build step RB1), so that at the moment of trust on first use
+the owner sees, besides the reviewer's name and endpoint, whether anything else decides where digests go. It shows no
+path of `base_url`, no proxy URL and no CA file's path: the pin file holds them, which the owner reads as root to see
+everything that was pinned. Every refusal is logged here and raised as a StartupError with `logged=True`: exit code 2.
+Its second line gives the remedy: remove the pin file as root (REMEDY), or, when the agent cannot use the state folder
 itself (it cannot open it, or the folder is its own but its mode lacks u+rwx), make it the agent's own folder
-(FOLDER_REMEDY). A missing folder is one line that names the command that creates it, and a failed write, which leaves
-no pin file, has no second line.
+(FOLDER_REMEDY), or, when the state folder is a symlink, which the folder's open refuses, replace the link with a
+folder of the agent's own (FOLDER_SYMLINK_REMEDY). A missing folder is one line that names the command that creates
+it, and a failed write, which leaves no pin file, has no second line.
 """
 
 from __future__ import annotations
@@ -62,6 +68,15 @@ REMEDY = (
 FOLDER_REMEDY = (
     "repair reviewer pin: the agent cannot use its state folder; check state.dir in repair.yaml, and as root make it "
     "the agent's own folder with: install -d -m 0700 -o %s -g %s %s"
+)
+# The remedy when the state folder is a symlink, which the folder's open (O_NOFOLLOW) refuses: FOLDER_REMEDY's
+# `install -d` would follow the link and leave it in place, so the agent would stop again with the same lines. The
+# link itself is removed (`rm` removes a link, never what it names; `state.dir` never ends in `/`), then the folder is
+# created as `folder_missing`'s command creates it.
+FOLDER_SYMLINK_REMEDY = (
+    "repair reviewer pin: the agent's state folder is a symlink, which it does not follow; check state.dir in "
+    "repair.yaml, and as root replace the link with a folder of the agent's own: rm %s && install -d -m 0700 -o %s "
+    "-g %s %s"
 )
 # What the agent's own state folder must give its user: read (open it), search (open the pin in it) and write (make
 # the pin). The runbook's command creates it 0700.
@@ -123,7 +138,8 @@ def check_reviewer_pin(state_dir: str, reviewer: ReviewerSettings, endpoint: str
     folder: int | None = None
     reason = f"{UNREADABLE}:EIO"
     try:
-        folder = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
+        # O_NOFOLLOW: a symlinked folder fails here (ENOTDIR on Linux), even with the isolation check waived.
+        folder = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         _check_own_folder_mode(os.fstat(folder))
     except OSError as exc:
         if folder is not None:
@@ -143,9 +159,12 @@ def check_reviewer_pin(state_dir: str, reviewer: ReviewerSettings, endpoint: str
                 path,
                 *command,
             )
-        else:  # there, but not a folder the agent can use (EACCES, ENOTDIR, ELOOP...): no pin file to remove
+        else:  # there, but not a folder the agent can use (EACCES; ENOTDIR, a file or a symlink...): no pin to remove
             logger.error("repair reviewer pin unusable path=%s reason=%s", path, reason)
-            logger.error(FOLDER_REMEDY, *command)
+            if _is_symlink(state_dir):  # `install -d` alone would follow the link: it must be replaced
+                logger.error(FOLDER_SYMLINK_REMEDY, shlex.quote(state_dir), *command)
+            else:
+                logger.error(FOLDER_REMEDY, *command)
         raise StartupError("repair reviewer pin unusable", logged=True)
     try:
         current = pinned_values(reviewer)
@@ -160,7 +179,13 @@ def check_reviewer_pin(state_dir: str, reviewer: ReviewerSettings, endpoint: str
         if unusable is not None:
             _refuse_unusable(path, unusable)
         if pinned is None:
-            logger.info("repair reviewer pinned reviewer=%s endpoint=%s", reviewer.name, endpoint)
+            logger.info(
+                "repair reviewer pinned reviewer=%s endpoint=%s proxy=%s ca_bundle=%s",
+                reviewer.name,
+                endpoint,
+                _set_or_none(current["proxy"]),
+                _set_or_none(current["ca_bundle"]),
+            )
             return
         changed = [name for name in PINNED_FIELDS if pinned[name] != current[name]]
         if changed:
@@ -169,6 +194,20 @@ def check_reviewer_pin(state_dir: str, reviewer: ReviewerSettings, endpoint: str
             raise StartupError("repair reviewer changed since it was pinned", logged=True)
     finally:
         os.close(folder)
+
+
+def _set_or_none(value: str | None) -> str:
+    """Whether a pinned setting is set, for the pinned line: never its value."""
+    return "none" if value is None else "set"
+
+
+def _is_symlink(path: str) -> bool:
+    """Whether `path` is a symlink itself (`os.lstat`), for the remedy of a state folder the agent could not open;
+    False when it cannot be looked at."""
+    try:
+        return stat.S_ISLNK(os.lstat(path).st_mode)
+    except (OSError, ValueError):
+        return False
 
 
 def _check_own_folder_mode(info: os.stat_result) -> None:

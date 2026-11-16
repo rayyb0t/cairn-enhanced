@@ -456,7 +456,7 @@ def test_a_half_written_last_line_is_skipped_times_at_the_ends_of_the_range() ->
 
 
 # Every field that spec §9.5 types, in every record of the seven files, given another type or left out (the reference
-# reading's field fuzz of the amendment's third round, phase2bg/fix-r3/tools/fuzz_r3.py, ported to these readers).
+# reading's field fuzz of the spec amendment's third round, ported to these readers).
 
 TYPED_FIELDS = frozenset(
     {
