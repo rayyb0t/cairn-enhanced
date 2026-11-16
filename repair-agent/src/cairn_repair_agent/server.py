@@ -4,7 +4,10 @@ Its own `requests.Session` with `trust_env = False` and no proxy, so the agent t
 go straight to the settings file's `server`; no request follows a redirect (§9.9), and a redirect's body is never
 read. The agent token goes only to the repair endpoints, in `X-Cairn-Repair-Token` (§7); a dev-0.3.0 port's
 `X-API-Key`, when configured, goes with every request. A call never raises for an HTTP status: it returns the status
-and the decoded body, and status 0 when no answer arrived.
+and the decoded body, and status 0 when no answer arrived. Nor does it raise for anything the request or the read of
+its answer raises: `requests` lets an `OSError` through for a CA file removed after the start, and urllib3's
+`LocationParseError` for a host it cannot encode, and each is status 0 with the exception's class name, as a refused
+connection is.
 
 An answer is read with `Accept-Encoding: identity` and at most `SERVER_ANSWER_MAX_BYTES` of decoded body. The
 `server` URL comes from the settings file, which a local worker can point at a listener of its own (§9.3), so a larger
@@ -137,12 +140,12 @@ class RepairServerClient:
                 allow_redirects=False,
                 stream=True,
             )
-        except requests.RequestException as exc:
+        except Exception as exc:  # a RequestException, or what requests lets through (see the module docstring)
             return ServerAnswer(status=0, error=type(exc).__name__)
         try:
             # A redirect is final by its status alone (§9.9), so its body is never read.
             content = None if 300 <= response.status_code < 400 else _read_capped(response)
-        except requests.RequestException as exc:
+        except Exception as exc:
             return ServerAnswer(status=0, error=type(exc).__name__)
         finally:
             response.close()

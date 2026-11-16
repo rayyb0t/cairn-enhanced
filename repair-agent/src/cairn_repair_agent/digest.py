@@ -8,15 +8,18 @@ assistant messages. The run can write its own session file, so the derived figur
 system prompt says so; they are read only from the records the CLI writes (`transcripts.py`, §9.5), never from a tool's
 output, which the last calls only quote.
 
-Untrusted text is cleaned in this order (`clean_text`): NFKC; removal of Unicode Cc (except `\\n` and `\\t`), Cf, Co
-and Cs; exact-value removal of the agent's own secrets; `<` and `>` mapped to U+2039 and U+203A, and `untrusted...data`
-look-alikes rewritten to `untrusted-text`, so run text can neither open nor close the fence; then the pattern layer.
-A text is cleaned before it is cut to its limit, so no secret is cut in half before a layer could see it; a long
-one only in parts near what can be shown, cut at line breaks, or inside a line with a guard (`_Cleaner`).
+Untrusted text is cleaned in this order (`clean_text`): NFKC; removal of Unicode Cc (except `\\n` and `\\t`), Cf, Cn,
+Co and Cs; exact-value removal of the agent's own secrets; `<` and `>` mapped to U+2039 and U+203A, the square brackets
+of a chat template's control token (`[INST]`, `[/INST]`, `[SYSTEM_PROMPT]`, `[|user|]`, `[|endofturn|]`, `[unused9]`,
+in any case) to U+27E6 and U+27E7, and `untrusted...data` look-alikes rewritten to `untrusted-text`, so run text can
+neither open nor close the fence, nor write a turn boundary into a rendered chat template; then the pattern layer. A
+text is cleaned before it is cut to its limit, so no secret is cut in half before a layer could see it; a long one only
+in parts near what can be shown, cut at line breaks, or inside a line with a guard (`_Cleaner`).
 
 Size ladder, while over budget: last calls 12 → 10 → … → 4; output lines and message and fact lengths halved; output
 lines 0+1, messages 300, facts 150; 2 calls only; finally a cut inside the fence that keeps the closing tag. Every limit
-scales with `budget / 8000`.
+scales with `budget / 8000`. For a reviewer whose `context_window` is set, "over budget" also means over the room that
+context leaves, counted by `token_bound` (`DigestBudget`).
 """
 
 from __future__ import annotations
@@ -55,13 +58,67 @@ FACT_ID_CHARS = 40
 _RUN_ID_RULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{7,63}")
 _FENCE_LOOKALIKE = re.compile(r"untrusted[\s_\-\u2010-\u2015\u2212]*data", re.IGNORECASE)
 _ANGLES = str.maketrans({"<": LEFT_ANGLE, ">": RIGHT_ANGLE})
+LEFT_WHITE_BRACKET = "\u27e6"  # MATHEMATICAL LEFT WHITE SQUARE BRACKET, for the '[' of a control token in run text
+RIGHT_WHITE_BRACKET = "\u27e7"  # MATHEMATICAL RIGHT WHITE SQUARE BRACKET, for its ']'
+# The control tokens that chat templates write in square brackets. A local model server renders the chat template with
+# the digest inside and tokenizes that string with special-token parsing (Ollama's runner does, and so does a server
+# that tokenizes with a Hugging Face tokenizer), so such a token in run text would become a real turn boundary. Three
+# shapes, as the chat templates of local model servers write them (as of 2026-11):
+# - a word of CONTROL_WORDS, also closed with '/': the whole set of the model family whose templates use [INST] and
+#   [/INST] (the special tokens its tokenizer library lists), and another family's MASK words;
+# - any word between '[|' and '|]': a third family's templates write their role and end-of-turn markers so
+#   ([|system|], [|user|], [|assistant|], [|tool|], [|endofturn|]);
+# - a reserved word '[unused<n>]': a fourth family's templates open and close each turn with [unused9] and [unused10].
+CONTROL_WORDS = (
+    "INST",
+    "SYSTEM_PROMPT",
+    "AVAILABLE_TOOLS",
+    "TOOL_RESULTS",
+    "TOOL_CALLS",
+    "TOOL_CONTENT",
+    "IMG",
+    "IMG_BREAK",
+    "IMG_END",
+    "PREFIX",
+    "MIDDLE",
+    "SUFFIX",
+    "ARGS",
+    "CALL_ID",
+    "AUDIO",
+    "BEGIN_AUDIO",
+    "TRANSCRIBE",
+    "THINK",
+    "STREAMING_PAD",
+    "STREAMING_WORD",
+    "NEXT_AUDIO_TEXT",
+    "REPEAT_AUDIO_TEXT",
+    "MODEL_SETTINGS",
+    "MASK",
+    "GMASK",
+    "SMASK",
+)
+_CONTROL_TOKEN = re.compile(
+    r"\[(/?(?:" + "|".join(sorted(CONTROL_WORDS, key=len, reverse=True)) + r")|\|[A-Za-z_]{1,32}\||unused\d{1,4})\]",
+    re.IGNORECASE,
+)
 # --- tokens and budget --------------------------------------------------------------------------------------------------
 
 
 def estimate_tokens(text: str) -> int:
-    """§9.6's conservative estimate: ASCII characters ÷ 3 (rounded up) plus one token per non-ASCII character."""
+    """§9.6's estimate, the digest budget's measure: ASCII characters ÷ 3 (rounded up) plus one token per non-ASCII
+    character. It is calibrated, not a bound: digits, tabs and newlines are one token each to the tokenizers that split
+    them one by one, and a rare character is several. `token_bound` is the bound."""
     ascii_count = len(text.encode("ascii", "ignore"))
     return -(-ascii_count // 3) + (len(text) - ascii_count)
+
+
+def token_bound(text: str) -> int:
+    """A bound on the tokens of `text` that holds for byte-level BPE and byte-fallback SentencePiece tokenizers: one
+    token per UTF-8 byte (Appendix C-1, Digest budget). Each of their vocabularies has a token for every byte, and a
+    character that has no token of its own falls back to its bytes, so no text is more tokens than bytes: a rare or
+    unassigned character is up to 4, as many as its bytes, and a digit, a tab or a newline is 1 to the tokenizers that
+    split them."""
+    return len(text.encode("utf-8", "surrogatepass"))
 
 
 SYSTEM_PROMPT_TOKENS = estimate_tokens(SYSTEM_PROMPT)
@@ -74,48 +131,114 @@ def prompt_tokens_estimate(digest_text: str) -> int:
 
 def context_window_room(context_window: int, max_tokens: int) -> int:
     """Appendix C-1, Digest budget: what a reviewer's context leaves for the digest once the system prompt and the
-    longest answer fit, `context_window - system_est - max_tokens`."""
+    longest answer fit, `context_window - system_est - max_tokens`. `system_est`, §9.6's estimate of the system prompt,
+    is about 1,240, and covers the prompt itself and its chat template: the system prompt is 820 to 920 tokens to
+    each of eight byte-level and byte-fallback tokenizers of current model families (build step R2's evidence), and a
+    chat template adds at most about 100."""
     return context_window - SYSTEM_PROMPT_TOKENS - max_tokens
 
 
-def digest_budget(max_tokens_estimate: int, context_window: int | None, max_tokens: int) -> int:
+class DigestBudget(int):
+    """The budget of the digests sent to one reviewer (Appendix C-1, Digest budget). The int is the budget by §9.6's
+    estimate, which the size ladder scales with; `room`, set only when the reviewer's `context_window` is, is what that
+    context leaves for the digest, which every digest built for it then fits by `token_bound`, so that a server whose
+    real context is that `context_window` (or more) never gets a prompt longer than its context, which a truncating
+    server (Ollama) would cut silently. Without a room, or with a `context_window` larger than the server's real
+    context, nothing keeps the prompt within the context: the context-truncation check (`model._checked_prompt`) sees
+    a cut only when the context is below about the prompt's estimate.
+
+    It is an int so that it is logged and recorded as the budget it is: it equals that int and hashes as it. Two
+    budgets, though, are equal only when their rooms are too. A reviewer with `context_window` 16,384 keeps the
+    default budget of 8,000 and has a room, a reviewer without one has none, and their digests differ once the room
+    cuts one; so a set or a dict of the budgets of several reviewers, like the gate replay's, which builds one digest
+    per distinct budget, keeps them apart, and each reviewer gets the digest of its own budget and room. A plain int
+    in such a set or dict would stand for a budget of any room, so keep them out of it; and arithmetic on a budget
+    gives a plain int, without the room: `build_digest` reads the room of the budget it is given."""
+
+    room: int | None
+
+    def __new__(cls, tokens: int, room: int | None = None) -> DigestBudget:
+        budget = super().__new__(cls, tokens)
+        budget.room = room
+        return budget
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, DigestBudget):
+            return int.__eq__(self, other) and self.room == other.room
+        return int.__eq__(self, other)
+
+    def __ne__(self, other: object) -> bool:
+        if isinstance(other, DigestBudget):
+            return int.__ne__(self, other) or self.room != other.room
+        return int.__ne__(self, other)
+
+    __hash__ = int.__hash__  # the int's, as `__eq__` must allow: a budget equals the int of its tokens
+
+
+def digest_budget(max_tokens_estimate: int, context_window: int | None, max_tokens: int) -> DigestBudget:
     """The budget of the digests sent to a reviewer: `digest.max_tokens_estimate`, or less for a reviewer whose
-    `context_window` cannot hold it with the system prompt and `max_tokens` (Appendix C-1, Digest budget)."""
+    `context_window` cannot hold it with the system prompt and `max_tokens`; with a `context_window`, also the room it
+    leaves, which each digest fits by `token_bound` (Appendix C-1, Digest budget)."""
     if context_window is None:
-        return max_tokens_estimate
-    return min(max_tokens_estimate, context_window_room(context_window, max_tokens))
+        return DigestBudget(max_tokens_estimate)
+    room = context_window_room(context_window, max_tokens)
+    return DigestBudget(min(max_tokens_estimate, room), room)
 
 
 # --- cleaning ---------------------------------------------------------------------------------------------------------
 
 
+UNWANTED_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Cs"})
+_LAST_BMP = 0xFFFF
+
+
 @functools.cache
 def _unwanted_characters() -> re.Pattern[str]:
-    """Every character of Unicode categories Cc (but `\\n` and `\\t`), Cf, Co and Cs, as this interpreter's
-    `unicodedata` knows them, in one character class (built once, about 30 ranges)."""
+    """Runs of the characters below U+10000 of Unicode categories Cc (but `\\n` and `\\t`), Cf, Cn, Co and Cs, as this
+    interpreter's `unicodedata` knows them, in one character class (built once, about 350 ranges), or runs of the
+    characters above, whose categories `_without_unwanted` checks one by one. Cn, the unassigned code points, carries
+    no text: a tokenizer has no token for one and spends one per UTF-8 byte on it, up to four. The class holds no range
+    above U+FFFF, where Cn alone has about 370: with them, `re` checked every character of every text range by range,
+    about 25 times slower."""
     ranges: list[tuple[int, int]] = []
     start: int | None = None
-    for code in range(0x110000):
-        unwanted = code not in (0x09, 0x0A) and unicodedata.category(chr(code)) in ("Cc", "Cf", "Co", "Cs")
+    for code in range(_LAST_BMP + 1):
+        unwanted = code not in (0x09, 0x0A) and unicodedata.category(chr(code)) in UNWANTED_CATEGORIES
         if unwanted and start is None:
             start = code
         elif not unwanted and start is not None:
             ranges.append((start, code - 1))
             start = None
     if start is not None:
-        ranges.append((start, 0x10FFFF))
+        ranges.append((start, _LAST_BMP))
     parts = [
         re.escape(chr(low)) if low == high else f"{re.escape(chr(low))}-{re.escape(chr(high))}" for low, high in ranges
     ]
-    return re.compile("[" + "".join(parts) + "]+")
+    return re.compile("[" + "".join(parts) + "]+|[" + chr(_LAST_BMP + 1) + "-" + chr(0x10FFFF) + "]+")
+
+
+def _without_unwanted(match: re.Match[str]) -> str:
+    """A run of `_unwanted_characters`: nothing for a run below U+10000, and for a run above it, its characters that
+    are not of those categories."""
+    run = match.group()
+    if ord(run[0]) <= _LAST_BMP:
+        return ""
+    return "".join(char for char in run if unicodedata.category(char) not in UNWANTED_CATEGORIES)
+
+
+def _white_brackets(match: re.Match[str]) -> str:
+    return LEFT_WHITE_BRACKET + match.group(1) + RIGHT_WHITE_BRACKET
 
 
 def clean_text(text: str, exact: ExactSecrets, counts: Counter[str]) -> str:
-    """Spec §9.6's cleaning of untrusted text, steps 1-5 in order; redactions are counted into `counts`."""
+    """Spec §9.6's cleaning of untrusted text, steps 1-5 in order; redactions are counted into `counts`. Step 4 maps
+    the square brackets of a control token after steps 1 and 2, so a full-width form, or one with a removed character
+    in it, is caught too, and after step 3, so a secret that holds a control token is removed whole first."""
     text = unicodedata.normalize("NFKC", text)
-    text = _unwanted_characters().sub("", text)
-    text = exact.redact(text, counts)  # before the brackets are mapped: a secret may hold '<' or '>'
+    text = _unwanted_characters().sub(_without_unwanted, text)
+    text = exact.redact(text, counts)  # before the brackets are mapped: a secret may hold '<', '>' or '[INST]'
     text = text.translate(_ANGLES)
+    text = _CONTROL_TOKEN.sub(_white_brackets, text)
     text = _FENCE_LOOKALIKE.sub("untrusted-text", text)
     return redact_patterns(text, counts)
 
@@ -696,26 +819,38 @@ def _output_lines(cleaned: _Cleaned, head: int, tail: int, limit: int) -> list[s
 class _Body:
     """The lines inside the fence, with the size of the digest they make with the header and the closing tag. Once the
     digest is over budget no line is added: no rung then fits, and the final cut keeps lines from the top, so that no
-    line after that one could be shown."""
+    line after that one could be shown. Over budget means over `budget` by §9.6's estimate, or over `room` by
+    `token_bound` when the reviewer's context_window sets one."""
 
     budget: int
+    room: int | None
     ascii: int  # ASCII characters of the header, the lines with their line breaks, and the closing tag
     other: int  # and their other characters
+    other_bytes: int  # and those characters' UTF-8 bytes
     lines: list[tuple[str, frozenset[str], bool]] = field(default_factory=list)  # (text, ids on it, a running entry)
 
     @property
     def over(self) -> bool:
-        return -(-self.ascii // 3) + self.other > self.budget
+        return not _fits(self.ascii, self.other, self.other_bytes, self.budget, self.room)
 
     def add(self, text: str, ids: frozenset[str] = frozenset(), running: bool = False) -> None:
         if self.over:
             return
         self.lines.append((text, ids, running))
-        ascii_count, other = _characters(text)
+        ascii_count, other, other_bytes = _characters(text)
         self.ascii, self.other = self.ascii + ascii_count + 1, self.other + other
+        self.other_bytes += other_bytes
 
     def copy(self) -> _Body:
-        return _Body(self.budget, self.ascii, self.other, list(self.lines))
+        return _Body(self.budget, self.room, self.ascii, self.other, self.other_bytes, list(self.lines))
+
+
+def _fits(ascii_count: int, other: int, other_bytes: int, budget: int, room: int | None) -> bool:
+    """Whether text of these characters is within the budget by §9.6's estimate, and within the room by
+    `token_bound` (its UTF-8 bytes) when there is one."""
+    if -(-ascii_count // 3) + other > budget:
+        return False
+    return room is None or ascii_count + other_bytes <= room
 
 
 def _tool_name(call: ToolCall, clean: _Cleaner) -> str:
@@ -867,6 +1002,7 @@ def build_digest(
     `source_facts` and `new_facts` come from `facts_for_run`, None when unknown. `exact` holds the agent's own secrets
     (`ExactSecrets.for_agent`), and `budget` is the reviewer's digest budget (`digest_budget`): neither has a default,
     so that no caller can build a digest without §9.6's step 3, or without its reviewer's budget, by leaving one out.
+    A `DigestBudget` with a room also keeps the digest within that room by `token_bound`; a plain int sets no room.
     """
     nonce = nonce if nonce is not None else secrets.token_hex(8)
     opening, closing = f'<{FENCE} id="{nonce}">', f'</{FENCE} id="{nonce}">'
@@ -874,8 +1010,9 @@ def build_digest(
     clean = _Cleaner(exact)
     head = "\n".join(_header(context)) + "\n" + opening + "\n"
     steps = ladder(budget)
+    room = budget.room if isinstance(budget, DigestBudget) else None
     # The derived figures are the same on every rung: rendered once. When they alone are over budget, no rung fits.
-    derived = _Body(budget, *_characters(head + closing))
+    derived = _Body(budget, room, *_characters(head + closing))
     _render_derived(figures, clean, steps[0].command_chars, derived)
     derived_used = set(clean.used)
     shrunk = len(steps)  # the final cut, unless a rung fits
@@ -889,7 +1026,7 @@ def build_digest(
                 shrunk = index
                 break
     if shrunk == len(steps):
-        body = _cut_body(body, head, closing, budget)
+        body = _cut_body(body, head, closing, budget, room)
     text = _join(head, body, closing)
     present = frozenset(identifier for _, ids, _ in body.lines for identifier in ids)
     running = frozenset(identifier for _, ids, is_running in body.lines if is_running for identifier in ids)
@@ -912,30 +1049,41 @@ def _join(head: str, body: _Body, closing: str) -> str:
     return head + "\n".join(line for line, _, _ in body.lines) + "\n" + closing
 
 
-def _characters(text: str) -> tuple[int, int]:
+def _characters(text: str) -> tuple[int, int, int]:
+    """The ASCII characters of `text`, its other characters, and their UTF-8 bytes."""
     ascii_count = len(text.encode("ascii", "ignore"))
-    return ascii_count, len(text) - ascii_count
+    return ascii_count, len(text) - ascii_count, token_bound(text) - ascii_count
 
 
-def _cut_body(body: _Body, head: str, closing: str, budget: int) -> _Body:
+def _cut_body(body: _Body, head: str, closing: str, budget: int, room: int | None) -> _Body:
     """The last rung: a cut inside the fence. The body's lines are kept from the top while they fit with the note and
     the closing tag, which always stays."""
-    ascii_count, other = _characters(head + CUT_NOTE + "\n" + closing)
+    ascii_count, other, other_bytes = _characters(head + CUT_NOTE + "\n" + closing)
     kept: list[tuple[str, frozenset[str], bool]] = []
     for line, ids, running in body.lines:
-        line_ascii, line_other = _characters(line + "\n")
-        if -(-(ascii_count + line_ascii) // 3) + other + line_other > budget:
+        line_ascii, line_other, line_bytes = _characters(line + "\n")
+        if not _fits(ascii_count + line_ascii, other + line_other, other_bytes + line_bytes, budget, room):
             break
-        ascii_count, other = ascii_count + line_ascii, other + line_other
+        ascii_count, other, other_bytes = ascii_count + line_ascii, other + line_other, other_bytes + line_bytes
         kept.append((line, ids, running))
     kept.append((CUT_NOTE, frozenset(), False))
-    return _Body(budget, ascii_count, other, kept)
+    return _Body(budget, room, ascii_count, other, other_bytes, kept)
+
+
+# The server keeps a run's started_at in whole seconds: it truncates its own clock to the second and subtracts the
+# dispatcher's started_seconds_ago rounded to a second, so started_at is up to 1.5 s before the run's true start, and
+# the dispatcher's checked_elapsed_seconds, rounded to 0.1 s, adds up to 0.05 s more. The live cut is that much later
+# than the sum, so that it is never before the moment the copy was taken: every record in the copy is before the cut,
+# and a call whose result is in the copy is finished at it. A running call's time is then overstated by at most about
+# 2.6 s, which no figure of the digest depends on.
+LIVE_CUT_SLACK_SECONDS = 2.0
 
 
 def live_cut(started_at: datetime, checked_elapsed_seconds: float) -> datetime:
-    """The live digest's cut: the copy's last check, `checked_elapsed_seconds` after the run's `started_at` (§9.6).
-    Raises ValueError when that time is out of range."""
+    """The live digest's cut: the copy's last check, `checked_elapsed_seconds` after the run's `started_at`, plus
+    LIVE_CUT_SLACK_SECONDS for the server's whole-second `started_at` (§9.6). Raises ValueError when that time is out
+    of range."""
     try:
-        return started_at + timedelta(seconds=checked_elapsed_seconds)
+        return started_at + timedelta(seconds=checked_elapsed_seconds + LIVE_CUT_SLACK_SECONDS)
     except OverflowError:
         raise ValueError("the copy's checked time is out of range") from None

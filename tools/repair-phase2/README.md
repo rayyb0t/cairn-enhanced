@@ -159,6 +159,7 @@ repair:
         REVIEW_API_KEY: "<your Claude API key>"        # between REVIEW_MODEL and REVIEW_BASE_URL
         REVIEW_BASE_URL: "https://api.anthropic.com"   # without /v1
     - name: "reviewer_openai_compatible"               # api_format left out: openai_chat
+      context_window: 16384                            # a model server's context, never more (below)
       env:
         REVIEW_MODEL: "<model name>"
         REVIEW_API_KEY: "<that provider's key for the reviewer>"
@@ -181,6 +182,7 @@ repair:
         REVIEW_API_KEY: "<your Claude API key>"        # between REVIEW_MODEL and REVIEW_BASE_URL
         REVIEW_BASE_URL: "https://api.anthropic.com"
     - name: "reviewer_openai_compatible"
+      context_window: 16384                            # a model server's context, never more (below)
       env:
         REVIEW_MODEL: "<model name>"
         REVIEW_API_KEY: "<that provider's key for the reviewer>"
@@ -206,6 +208,19 @@ A reviewer's optional settings sit beside its `env`: `timeout_seconds`, `max_tok
 (`input_per_mtok` and `output_per_mtok`, the price per million tokens, for the replay's cost ceiling).
 Left out, each has its default. A `ca_bundle` is a path the agent opens: on a host a file in
 `/etc/cairn-repair/` (step 4 d), in Compose a file you mount read-only into `cairn-repair`.
+
+**A model server on this host needs `context_window`**, the context in tokens that the server gives
+the model. Give the server a context of at least 16,384 tokens (Ollama: `OLLAMA_CONTEXT_LENGTH=16384`
+in the server's environment, or `PARAMETER num_ctx 16384` in a Modelfile) and set the reviewer's
+`context_window` to exactly that value, never more, as both examples do; change both together. Such
+a server cuts a prompt longer than its context without an error, keeping only its first few tokens
+and the tail, so the model sees neither the system prompt nor the trusted header, only the run's
+own text. With `context_window` set, the agent sizes every digest so that the prompt and the answer
+fit, and the server never cuts it. Without it, or with a value larger than the server's real
+context, a run whose output is mostly digits, hex or rare characters can make the prompt three to
+four times the agent's estimate, and the agent's own check (`context_truncated`) catches a cut only
+when the server's context is below a few thousand tokens. A hosted API answers an over-long prompt
+with an error instead: set its `context_window` to its model's context, or leave it out.
 
 A reviewer that the agent can reach only through a proxy needs `proxy: "http://<host>:<port>"` beside
 its `env`: its model client uses that proxy and no other. The agent removes `http_proxy`,

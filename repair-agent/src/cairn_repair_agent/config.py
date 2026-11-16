@@ -163,7 +163,9 @@ def _rule(text: str) -> PydanticCustomError:
 
 
 def url_problem(value: str) -> str | None:
-    """Why `value` is not an http:// or https:// URL with a host and a valid port; None when it is one."""
+    """Why `value` is not an http:// or https:// URL with a host and a valid port; None when it is one. A host with an
+    empty label (`a..b`) or a label over 63 characters is refused: urllib3 cannot encode it, so every request to it
+    would fail, and the server client's polls with it."""
     if "<" in value or ">" in value:
         return "still holds a <...> placeholder"
     if not value.startswith(("http://", "https://")):
@@ -177,6 +179,10 @@ def url_problem(value: str) -> str | None:
         return "has an invalid host or port"
     if not parts.hostname:
         return "has no host"
+    try:
+        parts.hostname.encode("idna")
+    except UnicodeError:
+        return "has a host with an empty label or a label over 63 characters"
     if port is not None and not 1 <= port <= 65535:
         return "has a port outside 1-65535"
     return None

@@ -1141,6 +1141,7 @@ repair:                                   # 可选；不写时即今天的 Dispa
         REVIEW_MODEL: "<model name>"
         # REVIEW_API_KEY: 这里可以不写（没有认证的本地服务）
         REVIEW_BASE_URL: "http://127.0.0.1:11434/v1"   # OpenAI 兼容的 base URL，按修复代理访问到的地址填写
+      context_window: 16384               # 服务端给模型的上下文（token），与服务端的设置相同，绝不能更大；本地模型服务必须设置
     - name: "reviewer_provider"
       env:
         REVIEW_MODEL: "<model name>"
@@ -1189,6 +1190,7 @@ repair:                                   # 可选；不写时即今天的 Dispa
 | `structured_output`、`max_tokens`、`context_window`、`timeout_seconds`、`max_attempts`、`ca_bundle`、`proxy`、`price` | 可选。`structured_output` 为布尔值；`max_tokens`、`context_window`、`timeout_seconds` 与 `max_attempts` 为 ≥ 1 的整数；`ca_bundle` 与 `proxy` 为非空字符串；`price` 为恰好含 `input_per_mtok` 与 `output_per_mtok` 两个键的对象，各为 ≥ 0 的有限数 | 修复代理模型客户端的设置，含义与默认值见 `docs/specs/repair-agent.md`。不写或为 null 时修复代理取默认值。Dispatcher 只检查这些类型与 `price` 的两个键，取值由修复代理在启动时检查，它不接受的值会让它拒绝启动 |
 
 - `env` 只允许这三个名称，条目只允许这些键，其他任何内容都是错误；仍含 `<` 或 `>` 的字符串（未替换的占位符）也是错误。只有一个模型客户端，它按 `api_format` 发出调用，因此没有 `provider` 键，早期设计中 Anthropic SDK 客户端的设置（`effort`、`server_fallbacks`）也不存在。
+- 本地模型服务（例如 Ollama）的评审模型必须设置 `context_window`，等于服务端真正的上下文，绝不能更大，并与服务端的设置一起修改，如示例中的 `reviewer_local`（服务端的上下文设为 16,384）。这类服务端会悄悄截断超过其上下文的 prompt，只保留开头几个 token 与尾部，模型因此看不到系统 prompt 与可信头部。设置了 `context_window` 时，修复代理据此确定每个 digest 的大小，服务端不会截断它；不设置，或大于服务端真正的上下文时，以数字、十六进制或罕见字符为主的运行输出可以让 prompt 超出上下文，而修复代理的 `context_truncated` 检查只能发现上下文低于几千 token 的截断（见 `docs/specs/repair-agent.md`「digest 预算」）。托管的 API 对超长的 prompt 返回错误：设为其模型的上下文，或者不写。
 - 每个评审模型都有自己的 key；没有复用某个 Worker 的 provider、模型或 key 的写法。
 - 评审模型不是 Worker：它不是 `workers:` 条目，没有 `WorkerType` 或 `TaskType`，调度器、Worker 选择与 Worker 健康检查都看不到它。
 - `common_env` 从不合并进评审模型条目，评审模型的 `env` 也从不传给任何进程：修复代理通过设置文件得到这些值。
@@ -1208,7 +1210,7 @@ repair:                                   # 可选；不写时即今天的 Dispa
 ```json
 {"version": 1, "server": "http://127.0.0.1:8000", "projects": null,
  "reviewers": [{"name": "reviewer_local", "model": "<model name>", "base_url": "http://127.0.0.1:11434/v1", "api_key": null,
-                "api_format": "openai_chat"},
+                "api_format": "openai_chat", "context_window": 16384},
                {"name": "reviewer_provider", "model": "<model name>", "base_url": "https://<your provider>/v1",
                 "api_key": "<the reviewer's own key>", "api_format": "openai_chat", "timeout_seconds": 180},
                {"name": "reviewer_claude", "model": "<model name>", "base_url": "https://api.anthropic.com",
@@ -1408,7 +1410,7 @@ ERROR   repair module unavailable, running today's explore task project=%s      
 | `repair.reviewers[].api_format` | 否 | `openai_chat`（默认）或 `anthropic_messages` |
 | `repair.reviewers[].structured_output` | 否 | 布尔值，修复代理默认 true；只用于 `openai_chat` |
 | `repair.reviewers[].max_tokens` | 否 | ≥ 1 的整数，修复代理默认 4096 |
-| `repair.reviewers[].context_window` | 否 | ≥ 1 的整数，默认 null；决定发给该评审模型的 digest 预算 |
+| `repair.reviewers[].context_window` | 否 | ≥ 1 的整数，默认 null；服务端给该评审模型的上下文（token），决定发给它的 digest 预算与 room（每个 digest 的 UTF-8 字节上限）。本地模型服务（例如 Ollama，会悄悄截断超过其上下文的 prompt）必须设置为服务端真正的上下文，绝不能更大（见 `docs/specs/repair-agent.md`「digest 预算」）；默认 null 只适合不会截断 prompt 的服务端 |
 | `repair.reviewers[].timeout_seconds` | 否 | ≥ 1 的整数，默认 180；每次尝试的时限 |
 | `repair.reviewers[].max_attempts` | 否 | ≥ 1 的整数，默认 2 |
 | `repair.reviewers[].ca_bundle` | 否 | 非空字符串：https `base_url` 的 CA 文件，按修复代理看到的路径 |

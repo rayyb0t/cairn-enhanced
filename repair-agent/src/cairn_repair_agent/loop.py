@@ -21,9 +21,15 @@ other status (a redirect included: none is followed) are final errors. A review 
 server records the window as not reviewed. Codes and field names from the server are logged only when they are plain
 names, else as `other`. With `--dry-run` nothing is posted.
 
+A failed poll is retried after `poll_interval`, doubling with each failure in a row, but never later than 15 s (or
+`poll_interval`, when that is longer): a window is open for at least 17 s (a 351 s budget), so after an outage the next
+poll still finds it open. An exception from a poll, which the server client turns into status 0 wherever it can, is a
+failed poll too: logged with its class name only, and never the end of the loop.
+
 SIGINT or SIGTERM stops polling and waits up to 15 s for the reviews in flight; a second signal exits at once (§9.3
-step 7). With `--once` the agent waits for every review its one poll started until such a signal comes, and from the
-signal on up to 15 s, as the loop does. A signal can come at any moment, so its handler takes no lock (`SignalStop`).
+step 7). A poll that a signal interrupts starts no review after it. With `--once` the agent waits for every review its
+one poll started until such a signal comes, and from the signal on up to 15 s, as the loop does. A signal can come at
+any moment, so its handler takes no lock (`SignalStop`).
 """
 
 from __future__ import annotations
@@ -53,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 FORGET_AFTER_SECONDS = 2 * 3600
 TOKEN_PAUSE_SECONDS = 60.0
-POLL_RETRY_MAX_SECONDS = 60
+POLL_RETRY_MAX_SECONDS = 15  # under the shortest open period, 17 s: floor(0.80 * 351) - floor(0.75 * 351)
 POST_RETRY_FIRST_SECONDS = 2.0
 POST_TIMEOUT_SECONDS = 30.0
 POST_TIMEOUT_MIN_SECONDS = 5.0
@@ -174,6 +180,7 @@ class RepairAgent:
         self._paused_until: float | None = None
         self._poll_failures = 0
         self._threads = threading.Semaphore(config.max_concurrent_reviews)
+        self._stop: Stop | None = None  # the stop that run() was given: a poll it interrupts starts no review
 
     @classmethod
     def from_started(cls, started: StartedAgent, **options: Any) -> RepairAgent:
@@ -200,20 +207,30 @@ class RepairAgent:
     # --- the poll ---------------------------------------------------------------------------------------------------
 
     def poll_once(self) -> float:
-        """One poll and the reviews it starts; returns the seconds to wait before the next poll."""
+        """One poll and the reviews it starts; returns the seconds to wait before the next poll. Once the stop of
+        `run` is set, which a signal can do while the poll's request is in flight, it starts no review: the windows it
+        lists are left to the next agent."""
         answer = self.server.list_runs()
         poll, runs = self._read_poll(answer)
         if poll is None or runs is None:
-            self._poll_failures += 1
-            retry_in = min(POLL_RETRY_MAX_SECONDS, self.config.poll_interval * 2 ** min(self._poll_failures - 1, 4))
-            logger.warning("repair agent poll failed status=%s retry_in=%ss", answer.status, retry_in)
-            return retry_in
+            return self._poll_failed(answer.status)
         self._poll_failures = 0
         for run in runs:
+            if self._stop is not None and self._stop.is_set():
+                break
             if isinstance(run, Mapping):
                 self._consider(run, poll)
         self._forget(poll.mono_at_response)
         return self.config.poll_interval
+
+    def _poll_failed(self, status: object) -> int:
+        """Log a failed poll and return the seconds to its retry: `poll_interval`, doubled with each failure in a row,
+        at most POLL_RETRY_MAX_SECONDS (or `poll_interval`, when that is longer)."""
+        self._poll_failures += 1
+        interval = self.config.poll_interval
+        retry_in = min(max(interval, POLL_RETRY_MAX_SECONDS), interval * 2 ** min(self._poll_failures - 1, 4))
+        logger.warning("repair agent poll failed status=%s retry_in=%ss", status, retry_in)
+        return retry_in
 
     def _read_poll(self, answer: ServerAnswer) -> tuple[Poll | None, list[Any] | None]:
         mono = self._monotonic()
@@ -352,9 +369,15 @@ class RepairAgent:
     def run(self, *, once: bool, stop: Stop) -> int:
         """Poll until `stop` is set (or once, with `once`), then wait for the reviews in flight: with `once`, until
         they end or `stop` is set; once `stop` is set, up to 15 s (§9.3 step 7). Returns the exit code. `stop` is only
-        read, with `is_set()`, and never waited on (see `SignalStop` and `stopped_within`)."""
+        read, with `is_set()`, and never waited on (see `SignalStop` and `stopped_within`); a poll that it interrupts
+        starts no review. An exception from a poll is a failed poll, logged with its class name only
+        (`status=error_<class>`), and polling goes on."""
+        self._stop = stop
         while True:
-            wait = self.poll_once()
+            try:
+                wait: float = self.poll_once()
+            except Exception as exc:  # never the end of the loop; the class name only, no message
+                wait = self._poll_failed(f"error_{class_name(exc)}")
             if once or stopped_within(wait, stop):
                 break
         while once and not stop.is_set():  # --once: every review the poll started, unless a signal comes first

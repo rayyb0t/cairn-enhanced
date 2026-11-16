@@ -212,6 +212,7 @@ def _check_compose_override() -> None:
         "container_name",
         "depends_on",
         "restart",
+        "stop_grace_period",
         "extra_hosts",
         "volumes",
         "command",

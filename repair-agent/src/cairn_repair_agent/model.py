@@ -342,7 +342,15 @@ def anthropic_answer(answer: object, prompt_est: int, request_id: str = "-") -> 
 
 def _checked_prompt(exchange: Exchange, prompt_est: int) -> Exchange:
     """The context-truncation check (C-1, Answers): a prompt count under half of the agent's estimate means the
-    server cut the prompt, so the answer is not used. Without a count, the answer is used and the check cannot run."""
+    server cut the prompt, so the answer is not used. Without a count, the answer is used and the check cannot run.
+
+    It sees a cut only when the server's context is below about `prompt_est`: Ollama cuts a prompt to about half its
+    context, so a cut prompt's count is under half the estimate only for a context under the estimate, a few thousand
+    tokens. What keeps a prompt whole is the digest's room (digest.DigestBudget), when the reviewer's context_window is
+    the server's real context; a reviewer without one, or with one larger than that context, can have its prompt cut
+    unseen by a server whose context is above the estimate. The estimate is calibrated, not a bound, in both directions:
+    very compressible run text can put a prompt the server read whole under half of it, which makes the review a
+    recorded continue (`context_truncated`), the fail-safe side."""
     if exchange.input_tokens is None:
         return replace(exchange, usage_missing=True)
     if 2 * exchange.input_tokens < prompt_est:

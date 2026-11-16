@@ -55,7 +55,7 @@ from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.workers.registry import get_driver
 from cairn_repair_agent import cli, mirror, model, review
 from cairn_repair_agent import config as agent_config
-from cairn_repair_agent.digest import ReviewContext, build_digest, live_cut
+from cairn_repair_agent.digest import LIVE_CUT_SLACK_SECONDS, ReviewContext, build_digest, live_cut
 from cairn_repair_agent.mirror import MirrorCopy, Unavailable, freshness_floor, read_copy
 from cairn_repair_agent.redact import NO_SECRETS
 from cairn_repair_agent.transcripts import parse_transcript
@@ -614,7 +614,8 @@ def test_a_session_file_unchanged_from_65_to_85_percent_is_reviewed_as_running(
     until 85%. The dispatcher's copy schedule (§8.8) copies once at 70% and then only rewrites meta.json. At the
     window's opening and at every re-read until it closes (every 5 s, §9.5 step 4), the agent's read_copy accepts the
     copy in <root>/<project_id>/<run_id>/, and the digest lists that call under RUNNING AT THE CUT, running from 65% to
-    checked_elapsed_seconds; the review at the opening cites it in a detach. With the checked-time rewrite removed, the
+    the live cut, checked_elapsed_seconds plus LIVE_CUT_SLACK_SECONDS (§9.6); the review at the opening cites it in a
+    detach. With the checked-time rewrite removed, the
     same review gets stale: every re-read until the window closes finds the copy last checked at 70%, and the review is
     a transcript_unreadable continue with no model call. Fake monotonic clocks for both parts, no sleeping.
     """
@@ -676,7 +677,7 @@ def test_a_session_file_unchanged_from_65_to_85_percent_is_reviewed_as_running(
         assert reviewed.digest is not None
         assert running_section(reviewed.digest) == [
             "RUNNING AT THE CUT:",
-            f"E2 t+19:30 Bash (running 180 s): {XC7_COMMAND}",
+            f"E2 t+19:30 Bash (running {int(OPENS + LIVE_CUT_SLACK_SECONDS - TOOL_CALL_AT)} s): {XC7_COMMAND}",
         ]
         [request] = model_stub.requests
         assert json.loads(request.body)["messages"][1]["content"] == reviewed.digest
@@ -703,7 +704,7 @@ def test_a_session_file_unchanged_from_65_to_85_percent_is_reviewed_as_running(
                 exact=NO_SECRETS,
                 budget=8000,
             )
-            running = int(checked - TOOL_CALL_AT)  # from 65% to checked_elapsed_seconds
+            running = int(checked + LIVE_CUT_SLACK_SECONDS - TOOL_CALL_AT)  # from 65% to the live cut (§9.6)
             assert running_section(digest.text) == [
                 "RUNNING AT THE CUT:",
                 f"E2 t+19:30 Bash (running {running} s): {XC7_COMMAND}",

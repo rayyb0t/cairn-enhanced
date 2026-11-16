@@ -28,6 +28,7 @@ services:
       cairn-dispatcher:
         condition: service_started            # writes the agent's settings file at its start
     restart: unless-stopped
+    stop_grace_period: 20s                    # over the agent's 15 s wait for reviews in flight; Docker's default is 10 s
     extra_hosts:
       - "host.docker.internal:host-gateway"   # a model server on the host
     volumes:
