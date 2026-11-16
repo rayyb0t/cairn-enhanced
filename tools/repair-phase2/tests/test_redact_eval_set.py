@@ -160,11 +160,12 @@ def test_redact_eval_set_uses_the_dispatcher_redaction(
     assert (folder / "transcript.redacted.jsonl").read_bytes() == redacted
 
 
-def test_container_mode_removes_worker_and_reviewer_keys_and_reads_no_credential_file(
+def test_container_mode_removes_worker_and_reviewer_keys_and_the_local_mode_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """In container mode the values are the workers' env (common_env included) and the reviewers' keys; the host's
-    CLI credential files are not read, as the live copy does not read them for a container run (§8.8)."""
+    """With a container-mode dispatch.yaml the values are the workers' env (common_env included) and the reviewers'
+    keys, and also the local mode's, the host's CLI credential files among them: the mode that counts is each run's
+    own, which a Phase 0 set does not record (final review TOOLS_SECURITY-2, amending §15.3 step 1)."""
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
     write_credential_files(home / ".claude", home / ".claude.json", home / ".codex", home / ".pi" / "agent")
@@ -175,10 +176,10 @@ def test_container_mode_removes_worker_and_reviewer_keys_and_reads_no_credential
     capsys.readouterr()
     redacted = (eval_dir / "i001" / "transcript.redacted.jsonl").read_bytes()
     assert WORKER_TOKEN.encode() not in redacted and REVIEWER_KEY.encode() not in redacted
-    assert CANARIES["claude:.credentials.json"].encode() in redacted  # only the agent's pattern layer sees these
+    assert not any(value.encode() in redacted for value in CANARIES.values())
     counts = json.loads((eval_dir / "i001" / "redaction.json").read_text())["redactions"]
     assert counts["ANTHROPIC_AUTH_TOKEN"] >= 2 and counts["REVIEW_API_KEY"] >= 2
-    assert not any(label in counts for label in CANARIES)
+    assert all(counts[label] >= 2 for label in CANARIES)
 
 
 def test_several_session_files_and_errors(

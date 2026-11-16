@@ -23,8 +23,13 @@ environment without proxy variables, and only loopback addresses are used.
 
 It creates one project with Repair on and waits for each step of the shadow path: the run registered, its transcript
 copied under `<root>/<project_id>/<run_id>/`, the agent's review recorded, the `repair_review` issue on the intent, the
-run's `/end` and its outcome. Exit 0 when every step showed within `--timeout`, else 1 with the missing steps and the
-logs' last lines; 2 when something could not start.
+run's `/end` and its outcome. The review step counts only the stub reviewer's own extend answer citing E1, which it
+gives only for a digest that lists a call E1: a review the agent recorded without a fallback, with that decision and
+that evidence, after the stub gave it. Any other review ends the wait at once: one with a fallback, as the agent
+records for any failure of the model call (spec 9.10), and one with the stub's continue answer, which it gives for a
+digest that lists no call, as a transcript the agent did not read into calls gives. Exit 0 when every step showed
+within `--timeout` and the stub reviewer answered a request, else 1 with the missing steps and the logs' last lines;
+2 when something could not start.
 
 Nothing it starts outlives it. The server, the dispatcher and the agent stay in its process group, so a signal to the
 group (Ctrl-C, timeout(1)) reaches them too. SIGTERM or SIGHUP to the smoke alone stops them, as its end does, and
@@ -36,6 +41,7 @@ handler sees, stops them; only the folder is then left. The fake worker exits wh
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -63,6 +69,21 @@ POLL_SECONDS = 2
 STARTUP_SECONDS = 60
 STOP_SECONDS = 15
 MODEL = "smoke-test-model"
+CHAT_PATH = "/v1/chat/completions"  # the agent's openai_chat request path under the stub's base_url, which ends in /v1
+# The stub reviewer's two answers: extend citing E1 for a digest that lists a call E1, else continue citing nothing.
+# Only the first is a review of the smoke's run (`Smoke.check`).
+EXTEND_ANSWER: dict[str, Any] = {
+    "decision": "extend",
+    "reason": "The run listed the lab folder and is unpacking the archive (smoke stub).",
+    "evidence": ["E1 the lab folder was listed"],
+    "next_step": "finish unpacking the lab archive",
+}
+CONTINUE_ANSWER: dict[str, Any] = {
+    "decision": "continue",
+    "reason": "Nothing to cite (smoke stub).",
+    "evidence": [],
+    "next_step": "",
+}
 STEPS = ("registered", "copied", "reviewed", "issue", "ended", "outcome")
 PROXY_VARIABLES = ("http_proxy", "https_proxy", "all_proxy", "no_proxy", "ftp_proxy")
 INTENT = "Smoke: list the files of the lab folder"
@@ -165,11 +186,31 @@ while time.monotonic() < deadline and os.getppid() == parent:
 
 @dataclass
 class Reviewer:
-    """The stub reviewer: an OpenAI-compatible endpoint on loopback, answering extend when it can cite E1."""
+    """The stub reviewer: an OpenAI-compatible endpoint on loopback, answering extend when it can cite E1
+    (EXTEND_ANSWER), else continue (CONTINUE_ANSWER). It answers only the agent's request path (CHAT_PATH; anything else
+    gets a 404, as a model server would answer it) and keeps each answer it gave, so that the smoke counts a recorded
+    review only when it carries the extend answer the stub gave (`reviewed`)."""
 
     requests: int = 0
+    answers: list[dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     server: ThreadingHTTPServer | None = None
+
+    def answered(self, decision: object, evidence: object) -> bool:
+        """Whether the stub answered this decision with this evidence."""
+        with self.lock:
+            return any(item["decision"] == decision and item["evidence"] == evidence for item in self.answers)
+
+    def reviewed(self, review: dict[str, Any]) -> bool:
+        """Whether the agent recorded `review` from the stub's extend answer citing E1: no fallback, that decision and
+        that evidence, which the stub gave. Its continue answer, which cites nothing, is no review of the run: it is
+        what the stub answers a digest that lists no call."""
+        return (
+            review.get("fallback") is None
+            and review.get("decision") == EXTEND_ANSWER["decision"]
+            and review.get("evidence") == EXTEND_ANSWER["evidence"]
+            and self.answered(EXTEND_ANSWER["decision"], EXTEND_ANSWER["evidence"])
+        )
 
     def start(self) -> str:
         stub = self
@@ -181,24 +222,17 @@ class Reviewer:
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 with stub.lock:
                     stub.requests += 1
+                if self.path != CHAT_PATH:
+                    self.reply(404, {"error": {"message": "no such path (smoke stub)"}})
+                    return
                 try:
                     digest = json.loads(body)["messages"][-1]["content"]
                 except (ValueError, KeyError, IndexError, TypeError):
                     digest = ""
-                if re.search(r"^E1 ", digest, re.MULTILINE):
-                    decision = {
-                        "decision": "extend",
-                        "reason": "The run listed the lab folder and is unpacking the archive (smoke stub).",
-                        "evidence": ["E1 the lab folder was listed"],
-                        "next_step": "finish unpacking the lab archive",
-                    }
-                else:
-                    decision = {
-                        "decision": "continue",
-                        "reason": "Nothing to cite (smoke stub).",
-                        "evidence": [],
-                        "next_step": "",
-                    }
+                found = re.search(r"^E1 ", digest, re.MULTILINE)
+                decision = copy.deepcopy(EXTEND_ANSWER if found else CONTINUE_ANSWER)
+                with stub.lock:
+                    stub.answers.append(decision)
                 reply = {
                     "model": MODEL,
                     "choices": [
@@ -210,8 +244,11 @@ class Reviewer:
                     ],
                     "usage": {"prompt_tokens": 100000, "completion_tokens": 60},
                 }
-                data = json.dumps(reply).encode("utf-8")
-                self.send_response(200)
+                self.reply(200, reply)
+
+            def reply(self, status: int, content: dict[str, Any]) -> None:
+                data = json.dumps(content).encode("utf-8")
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -394,10 +431,12 @@ class Smoke:
     layout: Layout
     agent_token: str
     session: requests.Session
+    reviewer: Reviewer = field(default_factory=Reviewer)
     project_id: str | None = None
     run_id: str | None = None
     seen: dict[str, str] = field(default_factory=dict)
     started: float = field(default_factory=time.monotonic)
+    wrong_review: str | None = None  # the window-1 review, when the agent recorded one that is not the stub's answer
 
     def get(self, path: str, *, agent: bool = False, **params: str) -> Any:
         headers = {"X-Cairn-Repair-Token": self.agent_token} if agent else {}
@@ -437,11 +476,15 @@ class Smoke:
                     f"located_by={copied.get('located_by')}",
                 )
         review = next((item for item in run.get("reviews", []) if item.get("window") == 1), None)
-        if review is not None and review.get("source") == "agent":
-            self.note(
-                "reviewed",
-                f"decision={review.get('decision')} fallback={review.get('fallback')} model={review.get('model')}",
-            )
+        if review is not None and review.get("source") == "agent" and "reviewed" not in self.seen:
+            detail = f"decision={review.get('decision')} fallback={review.get('fallback')} model={review.get('model')}"
+            # The stub reviewer's extend answer citing E1: not a fallback the agent posts for a model call that failed
+            # (spec 9.10), as a wrong URL, a refused request or a client error each still record a review, and not the
+            # stub's continue answer to a digest that lists no call.
+            if self.reviewer.reviewed(review):
+                self.note("reviewed", detail)
+            else:
+                self.wrong_review = detail
         project = self.get(f"/projects/{project_id}")
         issues = [
             issue
@@ -461,12 +504,12 @@ class Smoke:
             self.note("outcome", f"outcome={run.get('outcome')}")
 
 
-def run(layout: Layout, timeout: float) -> int:
+def run(layout: Layout, timeout: float, reviewer: Reviewer) -> int:
     agent_token = layout.write()
     session = requests.Session()
     session.trust_env = False
     processes: list[Process] = []
-    smoke = Smoke(layout, agent_token, session)
+    smoke = Smoke(layout, agent_token, session, reviewer)
     try:
         server_env = clean_environment(
             CAIRN_REPAIR_AGENT_TOKEN_FILE=str(layout.path("secrets", "agent.token")),
@@ -549,7 +592,7 @@ def run(layout: Layout, timeout: float) -> int:
             f"project {smoke.project_id}: Repair on; waiting for the shadow path (about {layout.budget + 30} s)\n"
         )
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and len(smoke.seen) < len(STEPS):
+        while time.monotonic() < deadline and len(smoke.seen) < len(STEPS) and smoke.wrong_review is None:
             try:
                 smoke.check()
             except (requests.RequestException, ValueError, KeyError, OSError) as exc:
@@ -560,6 +603,11 @@ def run(layout: Layout, timeout: float) -> int:
         missing = [step for step in STEPS if step not in smoke.seen]
         if missing:
             sys.stdout.write(f"MISSING steps: {', '.join(missing)}\n")
+            if smoke.wrong_review is not None:
+                sys.stdout.write(
+                    f"the agent recorded the review as {smoke.wrong_review}, not the stub reviewer's extend answer "
+                    "citing E1: a fallback, or the stub's answer to a digest that lists no call\n"
+                )
             for process in processes:
                 state = "running" if process.popen.poll() is None else f"exited {process.popen.returncode}"
                 sys.stdout.write(f"--- {process.name} ({state}), last lines of {process.log}:\n")
@@ -623,8 +671,11 @@ def smoke(args: argparse.Namespace) -> int:
         layout = Layout(base=base, port=free_port(), reviewer_url=reviewer.start(), budget=args.budget)
         sys.stdout.write(f"smoke folder {base}\n")
         sys.stdout.flush()
-        code = run(layout, args.timeout)
+        code = run(layout, args.timeout, reviewer)
         sys.stdout.write(f"stub reviewer answered {reviewer.requests} request(s)\n")
+        if code == EXIT_OK and reviewer.requests == 0:
+            sys.stdout.write("MISSING: the stub reviewer got no request, so no review came from it\n")
+            return EXIT_MISSING
         return code
     except Stopped as stopped:  # run() has stopped the processes it started on its way out
         sys.stdout.write(f"stopped by {stopped}: the processes the smoke started are stopped\n")

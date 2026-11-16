@@ -51,6 +51,7 @@ import requests
 from cairn_repair_agent import digest as digest_module
 from cairn_repair_agent import gate, replay
 from cairn_repair_agent.digest import Fact, ReviewContext, build_digest, prompt_tokens_estimate
+from cairn_repair_agent.prompt import SYSTEM_PROMPT
 from cairn_repair_agent.redact import ExactSecrets
 from cairn_repair_agent.transcripts import parse_transcript
 
@@ -360,11 +361,11 @@ def test_injection_probe_puts_the_text_inside_the_fence(
     # What the reviewer received for the probe is the injected digest, with the line inside the fence.
     sent = [seen.digest() for seen in stub.requests() if replay.INJECTION in seen.digest()]
     assert len(sent) == 2 and all(text.index(replay.INJECTION) > text.index("<untrusted_data") for text in sent)
-    # Without a finished call before the cut, the line goes to the intent text, which is inside the fence too.
+    # Without a finished call before the cut, the line becomes the intent text's first line, inside the fence too.
     case = replay.load_case(eval_dir / "i001", project=None, max_bytes=1 << 26)
     empty = replay.Case(**{**case.__dict__, "transcript": parse_transcript("codex", b"")})
     probed = replay.inject(empty)
-    assert probed.intent.endswith(replay.INJECTION) and probed.injected and not case.injected
+    assert probed.intent.split("\n")[0] == replay.INJECTION and probed.injected and not case.injected
 
 
 # --- GT6 --------------------------------------------------------------------------------------------------------------
@@ -400,8 +401,9 @@ def test_replay_refuses_without_yes_and_prints_each_reviewers_ceiling(
         name = line["reviewer"]
         digests = sorted((out / "digests" / name).iterdir())
         assert int(line["calls"]) == len(digests) == 6
+        # A bound: the UTF-8 bytes of the system prompt and of each digest (final review TOOLS_SECURITY-4).
         assert int(line["max_input_tokens"]) == sum(
-            prompt_tokens_estimate(path.read_text(encoding="utf-8")) for path in digests
+            len(SYSTEM_PROMPT.encode("utf-8")) + path.stat().st_size for path in digests
         )
         assert int(line["max_output_tokens"]) == 6 * max_tokens
     ceiling = (int(planned[0]["max_input_tokens"]) * 1 + int(planned[0]["max_output_tokens"]) * 2) / 1_000_000

@@ -42,7 +42,7 @@ from conftest import REVIEWER_KEY, SECOND_REVIEWER_KEY, Layout, reviewer_entry, 
 from records import NONCE, T, context
 from test_pin import write_eval_set
 
-from cairn_repair_agent import config, digest, model, replay
+from cairn_repair_agent import config, digest, model, prompt, replay
 from cairn_repair_agent.config import ANTHROPIC_MESSAGES, OPENAI_CHAT, StartupError, parse_settings
 from cairn_repair_agent.digest import (
     DEFAULT_MAX_TOKENS,
@@ -335,8 +335,10 @@ def test_the_request_carries_the_resolved_max_tokens_live_and_in_the_replay(
 
 
 def _planned_input(out: Path, reviewer: str) -> int:
+    """The plan's max_input_tokens for one call: a bound, the UTF-8 bytes of the system prompt and of the digest
+    (final review TOOLS_SECURITY-4, amending §15.3 step 6)."""
     (written,) = sorted((out / "digests" / reviewer).iterdir())
-    return digest.prompt_tokens_estimate(written.read_text(encoding="utf-8"))
+    return len(prompt.SYSTEM_PROMPT.encode("utf-8")) + written.stat().st_size
 
 
 COMPARED = [8000, 24000]  # replay_eval_set.py --digest-tokens 8000,24000, as §9.6 suggests

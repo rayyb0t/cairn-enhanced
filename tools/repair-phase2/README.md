@@ -36,7 +36,14 @@ There is exactly one place for a reviewer's key: its entry in the `repair:` sect
 dispatcher writes what the agent needs (the server's address, the optional `projects` list and the
 reviewers, each with its key) into `agent-settings.json` in the copy root at each start, and the
 agent reads that file at its own start. `repair.yaml`, `repair.compose.yaml` and `secrets/` are
-git-ignored, as `dispatch.yaml` and `datas/` already were.
+git-ignored, as `dispatch.yaml` and `datas/` already were. So are the evaluation gate's folders at the
+checkout's root, where its documented commands make them (`docs/specs/repair-agent.md`, 评估门禁工具):
+`eval-*/` (the eval set, with its unredacted session files and `project.json`), `replay-*/` (the
+digests sent to the reviewers, the decisions and `gate_report.json`) and `shadow-*/`; and, at the root
+too, `gate_report.json`, which a `gate_report.py --server` run without `--out` writes in the current
+folder, and `*labels.csv`, such as the live gate's `P-labels.csv`. They hold target data and stay on
+your machine, like the Phase 0 set; run the gate from the checkout's root, or give `--out` inside one
+of these folders, since the same names elsewhere in the tree are not ignored.
 
 **Compose: create every mounted file before the first `up`.** That is the two token files (step 1)
 and `./repair.compose.yaml` (step 4); also add step 3's `repair:` section to `./dispatch.yaml` first.

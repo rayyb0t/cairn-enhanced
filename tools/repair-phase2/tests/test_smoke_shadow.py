@@ -433,8 +433,12 @@ def test_on_its_timeout_the_end_to_end_test_stops_the_smoke_and_what_it_started(
 
 @pytest.mark.skipif(os.environ.get("CAIRN_REPAIR_SMOKE") != "1", reason="the full smoke takes about seven minutes")
 def test_smoke_shadow_end_to_end() -> None:
-    """XC5's steps through the real server, dispatcher and agent: register, copy, review, issue, /end, outcome."""
+    """XC5's steps through the real server, dispatcher and agent: register, copy, review, issue, /end, outcome. The
+    review is the stub reviewer's own answer, extend citing E1 with no fallback, from its one request (final review
+    TOOLS_CORRECTNESS-4: a fallback review, which the agent records for any failure of the model call, is no review)."""
     result = run_bound_to_pytest([sys.executable, str(Path(smoke_shadow.__file__))], timeout=1200)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "every step of the shadow path showed" in result.stdout
     assert json.dumps("smoke-test-model")[1:-1] in result.stdout  # the reviewer's model, logged by the agent
+    assert "reviewed: decision=extend fallback=None" in result.stdout
+    assert "stub reviewer answered 1 request(s)" in result.stdout

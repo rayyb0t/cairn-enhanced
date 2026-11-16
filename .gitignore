@@ -7,3 +7,11 @@ dispatch.yaml
 repair.yaml
 repair.compose.yaml
 secrets/
+# The evaluation gate's eval sets, replays and shadow exports (spec 15.3, 15.6): target data, kept local
+/eval-*/
+/replay-*/
+/shadow-*/
+# and, at the root, the gate's report and labels where the live gate (15.6) writes and reads them by default
+/gate_report.json
+/gate_report.json.tmp
+/*labels.csv

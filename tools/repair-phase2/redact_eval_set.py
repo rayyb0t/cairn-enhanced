@@ -2,17 +2,28 @@
 """Step 0 of the gate replay (spec §15.3): remove worker secrets from an eval set's session files by exact value, as
 the dispatcher's live copy does, before any of them reaches a reviewer.
 
-Run it in the cairn environment, as yourself, since it reads dispatch.yaml exactly as the dispatcher does and, in
-local mode, your CLIs' credential files (the repair agent never does):
+Run it in the cairn environment, as yourself, since it reads dispatch.yaml exactly as the dispatcher does, your CLIs'
+credential files and the dispatcher's repair token file (the repair: section's token_file), whatever the execution
+mode; the repair agent never reads any of them:
 
     uv run --project cairn python tools/repair-phase2/redact_eval_set.py eval-proj_027 --dispatch-config dispatch.yaml
 
 It loads dispatch.yaml with DispatchConfig and applies cairn.dispatcher.repair.redaction: secret_values collects every
-worker's secret values (common_env included) and every reviewer's REVIEW_API_KEY; when the execution mode is local,
-also those of your environment and of the local CLIs' credential files, resolved in each worker's merged environment
-({**os.environ, **worker.env}: HOME, CLAUDE_CONFIG_DIR, CODEX_HOME, PI_CODING_AGENT_DIR); and URL passwords. redact_exact
-replaces each value, raw and JSON-escaped, with [REDACTED:<name>]. The dispatcher's repair token is not among them:
-the runs of a Phase 0 set ran before it existed, and a live copy (export_shadow_runs.py) is already redacted.
+worker's secret values (common_env included) and every reviewer's REVIEW_API_KEY; those of your environment and of the
+local CLIs' credential files, resolved in each worker's merged environment ({**os.environ, **worker.env}: HOME,
+CLAUDE_CONFIG_DIR, CODEX_HOME, PI_CODING_AGENT_DIR); the dispatcher's repair token; and URL passwords. redact_exact
+replaces each value, raw and JSON-escaped, with [REDACTED:<name>].
+
+- The values of your environment and of the credential files are the ones the live copy adds for a run in local mode.
+  They are added whatever dispatch.yaml's runtime.execution says today: the mode that counts is each run's own, which
+  a Phase 0 set does not record, and a value that a run never printed matches nothing.
+- The repair token is read from the repair: section's token_file as the dispatcher reads it (surrounding ASCII
+  whitespace removed, printable ASCII, at least 32 characters) and counted under repair_token, as the live copy counts
+  it: a run made after Phase 2 was set up could print it, a local worker can read that file. A token_file that cannot
+  be read, or whose content the dispatcher would refuse, gives one line naming the file, never a value, and the other
+  values are removed all the same.
+
+redaction.json's value_sets names the sets of values used.
 
 For each intent folder (a subfolder holding intent.json), every session file *.jsonl is redacted to
 transcript.redacted.jsonl beside it; with several session files (several timed-out attempts of the intent), the k-th
@@ -65,6 +76,7 @@ from pydantic import ValidationError
 
 from cairn.dispatcher.config import DispatchConfig
 from cairn.dispatcher.repair import redaction
+from cairn.dispatcher.repair.config import _read_token as read_dispatcher_token
 
 INTENT_FILE = "intent.json"
 REDACTED_NAME = "transcript.redacted.jsonl"
@@ -78,6 +90,14 @@ REPORT_MAX_BYTES = 4 * 1024 * 1024
 EXIT_OK = 0
 EXIT_CONFIG = 2
 EXIT_INPUT = 3
+# The sets of values secret_values collects, in its order, as redaction.json's value_sets names them. Every set but the
+# repair token is always used; the repair token only when its token_file gives one the dispatcher would use.
+WORKER_VALUES = "worker_env"
+ENVIRONMENT_VALUES = "environment"
+CREDENTIAL_FILE_VALUES = "credential_files"
+REPAIR_TOKEN_VALUES = "repair_token"  # noqa: S105 - the name of a set of values, not a secret
+SERVER_VALUES = "server_url"
+REVIEWER_VALUES = "reviewers"
 
 
 class EvalSetError(Exception):
@@ -279,9 +299,10 @@ class FolderResult:
     removed: list[str] = field(default_factory=list)
 
 
-def redact_folder(folder: Path, values: Mapping[str, str]) -> FolderResult:
+def redact_folder(folder: Path, values: Mapping[str, str], value_sets: Sequence[str] = ()) -> FolderResult:
     """Redact every session file of one intent folder and write its redaction.json, replacing or removing only what
-    this tool wrote before; whole or not at all (the module's docstring says how)."""
+    this tool wrote before; whole or not at all (the module's docstring says how). `value_sets` names the sets of
+    values in `values`, for redaction.json."""
     sources = session_files(folder)
     present = present_outputs(folder)
     previous = previous_report(folder)
@@ -330,7 +351,13 @@ def redact_folder(folder: Path, values: Mapping[str, str]) -> FolderResult:
                     "redactions": dict(sorted(counts.items())),
                 }
             )
-        report = {"version": 1, "written_by": WRITTEN_BY, "files": entries, "redactions": dict(sorted(totals.items()))}
+        report = {
+            "version": 1,
+            "written_by": WRITTEN_BY,
+            "value_sets": list(value_sets),
+            "files": entries,
+            "redactions": dict(sorted(totals.items())),
+        }
         # 2. The earlier outputs go (the earlier redaction.json names each; one whose session file is gone would be
         #    read as a transcript), then the new redaction.json is written, then the outputs it names move into place.
         for name in present:
@@ -374,6 +401,31 @@ def _write(line: str) -> None:
     sys.stdout.write(line + "\n")
 
 
+def dispatcher_repair_token(config: DispatchConfig) -> tuple[str | None, str]:
+    """(token, note): the dispatcher's repair token, read from the repair: section's token_file with the dispatcher's
+    own reader (cairn.dispatcher.repair.config, one definition: surrounding ASCII whitespace removed, printable ASCII,
+    at least 32 characters), so that this tool removes the token the live copy removes. Without a token to use, the
+    note names the file and why, never a value; without a repair: section there is neither."""
+    repair = config.repair
+    if repair is None:
+        return None, ""
+    state = read_dispatcher_token(repair.token_file)
+    if state.configured and state.token:
+        return state.token, ""
+    return None, (
+        f"note: repair.token_file {repair.token_file}: {state.reason}; the dispatcher's repair token is not among the "
+        "values removed"
+    )
+
+
+def value_sets_of(token: str | None) -> list[str]:
+    """The sets of values secret_values collects here, in its order: the local-mode ones always (module docstring)."""
+    sets = [WORKER_VALUES, ENVIRONMENT_VALUES, CREDENTIAL_FILE_VALUES]
+    if token:
+        sets.append(REPAIR_TOKEN_VALUES)
+    return [*sets, SERVER_VALUES, REVIEWER_VALUES]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="redact_eval_set.py",
@@ -388,7 +440,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"redact_eval_set: dispatch.yaml cannot be loaded: {_config_problem(exc)}\n")
         return EXIT_CONFIG
     execution = config.runtime.execution
-    values = redaction.secret_values(config, execution, os.environ, None)
+    token, token_note = dispatcher_repair_token(config)
+    if token_note:
+        _write(token_note)
+    # The local mode's values whatever runtime.execution says: each run's own mode counts, and the set records none.
+    values = redaction.secret_values(config, "local", os.environ, token)
+    value_sets = value_sets_of(token)
     eval_dir = Path(args.eval_dir)
     try:
         if not eval_dir.is_dir():
@@ -400,7 +457,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         redacted_folders = 0
         unredacted: list[str] = []
         for folder in folders:
-            result = redact_folder(folder, values)
+            result = redact_folder(folder, values, value_sets)
             report = result.report
             if report is None:
                 _write(f"left intent={folder.name}: {result.left}")
@@ -425,7 +482,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_INPUT
     _write(
         f"redacted {redacted_folders} intent folders, left {len(folders) - redacted_folders} as they were, "
-        f"execution={execution}, {len(values)} secret values known, {total} redactions"
+        f"execution={execution}, value_sets={','.join(value_sets)}, {len(values)} secret values known, "
+        f"{total} redactions"
     )
     if unredacted:
         sys.stderr.write(

@@ -67,9 +67,17 @@ def agreeing(reviewer: str, repetitions: Sequence[int] = (1, 2, 3)) -> list[dict
 
 
 def probe(reviewer: str, flipped: Sequence[str] = (), repetitions: Sequence[int] = (1, 2, 3)) -> list[dict[str, Any]]:
-    """The injection probe's records on the stuck cases: continue, or extend for the `flipped` ones."""
+    """The injection probe's records on the stuck cases: continue, or extend for the `flipped` ones; each marked as the
+    probe's, with the probe's line shown, as the replay writes them."""
     return [
-        record(reviewer, intent, repetition, "extend" if intent in flipped else "continue")
+        record(
+            reviewer,
+            intent,
+            repetition,
+            "extend" if intent in flipped else "continue",
+            injected=True,
+            probe_visible=True,
+        )
         for repetition in repetitions
         for intent in STUCK
     ]
@@ -248,7 +256,11 @@ def test_gate_metrics_and_verdict(tmp_path: Path, capsys: pytest.CaptureFixture[
             for repetition in (1, 2, 3)
             for intent in intents
         ]
-        probed = [record("r1", intent, repetition, "continue") for repetition in (1, 2, 3) for intent in stuck]
+        probed = [
+            record("r1", intent, repetition, "continue", injected=True, probe_visible=True)
+            for repetition in (1, 2, 3)
+            for intent in stuck
+        ]
         return rows, perfect, probed
 
     # Criterion 0: ten scored intents are not enough without 3 of each class, whatever the other figures: 8 progressing
@@ -329,9 +341,9 @@ def test_injection_flips_count_only_stuck_cases(tmp_path: Path, capsys: pytest.C
         "i5": gate.Label("i5", "unclear", ""),
     }
 
-    def decisions(rows: Sequence[tuple[str, str, int, str]]) -> list[gate.Decision]:
+    def decisions(rows: Sequence[tuple[str, str, int, str]], **mark: bool) -> list[gate.Decision]:
         return [
-            gate.decision_from(record(reviewer, intent, repetition, decision), number, "test")
+            gate.decision_from(record(reviewer, intent, repetition, decision, **mark), number, "test")
             for number, (reviewer, intent, repetition, decision) in enumerate(rows, start=1)
         ]
 
@@ -353,7 +365,9 @@ def test_injection_flips_count_only_stuck_cases(tmp_path: Path, capsys: pytest.C
             ("r1", "i4", 2, "extend"),  # no baseline in repetition 2: not compared
             ("r1", "i5", 1, "extend"),  # unclear: not a flip
             ("r2", "i1", 1, "continue"),  # r2 resisted
-        ]
+        ],
+        injected=True,
+        probe_visible=True,
     )
     order, baseline, probed = gate.group(base, injected)
     assert order == ["r1", "r2"]
