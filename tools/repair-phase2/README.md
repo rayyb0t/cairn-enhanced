@@ -260,6 +260,15 @@ your workers use (in `common_env`, or exported in the dispatcher's shell) is not
 Compose, a proxy on the host is reached at `host.docker.internal` and must listen on the Docker bridge
 address, as a model server on the host must (Compose notes).
 
+The agent refuses at its start, with `agent settings invalid: …` naming the field, never the value, a
+`REVIEW_BASE_URL`, `proxy` or `dispatch.yaml` `server` that holds a backslash; one that urllib3's
+`parse_url`, which requests uses, cannot read or reads with another scheme, host or port than
+`urllib.parse`; and one whose host holds a character that requests would percent-encode (`"`, `^`, a
+backquote, `{`, `|` or `}`) or an IPv6 zone id, or starts with `*`. So the endpoint it shows, tests
+for plain http and pins is the one requests connects to. Write a backslash in a user name as `%5C`: a
+proxy's `DOMAIN\user` as `DOMAIN%5Cuser`, which requests decodes. The dispatcher also refuses a
+`REVIEW_BASE_URL` that holds a backslash, at its own start.
+
 The agent reviews live runs with the first entry; the gate replay runs every entry on the same cases.
 Once the gate has passed, put first the reviewer that passed, a local one if both did, and restart
 the dispatcher, then the agent (step 4). If that changes the first reviewer, the agent then refuses
@@ -414,7 +423,9 @@ In `repair.yaml` (edit it with `sudoedit`, which keeps its owner and mode):
 
 - `token_file: "/etc/cairn-repair/agent.token"`, `transcripts.root:
   "/var/lib/cairn-repair/transcripts"` and `state.dir: "/var/lib/cairn-repair/state"` (the folder of
-  step 4 b), as in the example.
+  step 4 b), as in the example. Write `state.dir` as the folder's own path: one that ends in `/` or
+  holds a `.` or `..` component stops the agent at its start (`state.dir: must not end in / or hold a
+  . or .. component`).
 - `dispatch_config_to_check`: the absolute path of the dispatcher's `dispatch.yaml` (mode 0600), such
   as `/home/<you>/cairn/dispatch.yaml`. The agent checks at its start that it cannot read it.
 - `isolation.unreadable_paths`: the absolute path of `secrets/repair-dispatcher.token`, such as
@@ -588,7 +599,9 @@ sudo cat /var/lib/cairn-repair/state/reviewer-pin.json
 ```
 
 In Compose, read it in the agent's volume with
-`docker compose -f docker-compose.yaml -f docker-compose.repair.yaml run --rm --no-deps --entrypoint cat cairn-repair /var/lib/cairn-repair/state/reviewer-pin.json`.
+`docker compose -f docker-compose.yaml -f docker-compose.repair.yaml run --rm --no-deps --entrypoint cat cairn-repair /var/lib/cairn-repair/state/reviewer-pin.json`;
+a non-root agent's pin is in its folder on the host, which you read with
+`sudo cat datas/repair-state/reviewer-pin.json` (Compose notes, "A non-root agent").
 At every later start the agent compares the reviewer with the pin. If any of these six changed, it
 refuses to start instead of sending a digest anywhere new (see "Accepting a reviewer change" below).
 So a worker that points the reviewer at a listener of its own stops the agent rather than
@@ -674,6 +687,12 @@ restarting the dispatcher (step 4):
   docker compose -f docker-compose.yaml -f docker-compose.repair.yaml run --rm --no-deps --entrypoint rm cairn-repair /var/lib/cairn-repair/state/reviewer-pin.json
   docker compose -f docker-compose.yaml -f docker-compose.repair.yaml up -d cairn-repair
   ```
+
+  A non-root agent's pin is in its folder on the host instead, and the agent starts from your copy of
+  the override: `sudo rm datas/repair-state/reviewer-pin.json`, then
+  `docker compose -f docker-compose.yaml -f <your copy of the override> up -d cairn-repair` (Compose
+  notes, "A non-root agent"). The two commands above would remove nothing of its own and recreate
+  the agent as root on the volume.
 
 The next start pins the new reviewer and logs `repair reviewer pinned …`: check what it pinned as for
 a first start (step 4 f, "The reviewer pin"). A change you did not make
@@ -764,19 +783,57 @@ the new agent; check its pin as in 6: from a build before the reviewer pin, its 
 `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml logs cairn-repair`, and you read
 the pin with
 `docker compose -f docker-compose.yaml -f docker-compose.repair.yaml run --rm --no-deps --entrypoint cat cairn-repair /var/lib/cairn-repair/state/reviewer-pin.json`.
-A non-root agent (Compose notes) run from a copy of the override made before the reviewer pin needs its
-own state folder first, and that copy has neither a `cairn-repair-state` line to replace nor a
-`./datas/repair-state` line: add the line `- ./datas/repair-state:/var/lib/cairn-repair/state` to the
-`volumes:` of `cairn-repair` in your copy, create the folder for the agent's user, then start with
-your copy in place of `docker-compose.repair.yaml`:
+A non-root agent (Compose notes) runs from your copy of the override, which this build's override has
+changed since: a copy made before the reviewer pin has neither a `cairn-repair-state` line to replace
+nor a `./datas/repair-state` line, and one made from an early Phase 2 build also lacks
+`stop_grace_period: 20s`. So do not patch the old copy with one line: make it again from this build's
+`docker-compose.repair.yaml` and re-apply your own changes (`user:`, `group_add:`, and the line of the
+`cairn-repair-state` volume replaced with `- ./datas/repair-state:/var/lib/cairn-repair/state`), or
+run `diff docker-compose.repair.yaml <your copy of the override>` and carry every other line over.
+Then create the state folder for the agent's user, make the agent's files readable by others again
+(`git pull` wrote the files it changed with your umask), and start with your copy in place of
+`docker-compose.repair.yaml`:
 
 ```bash
 sudo install -d -m 0700 -o <uid> -g <gid> datas/repair-state
+chmod -R a+rX repair-agent/pyproject.toml repair-agent/uv.lock repair-agent/src
 docker compose -f docker-compose.yaml -f <your copy of the override> up -d --build
 ```
 
-Without the line and the folder, the agent stops with
-`repair agent isolation check failed reasons=state_dir_owner`, and Compose starts it again and again.
+Then check its pin as in 6, on the host, where its folder is:
+`sudo cat datas/repair-state/reviewer-pin.json` (Compose notes, "A non-root agent"). Without the bind
+mount and the folder, the agent stops with `repair agent isolation check failed reasons=state_dir_owner`;
+without the `chmod`, a file that `git pull` wrote 0600 (umask 077), or 0640 (umask 027) when the agent
+is not in root's group, as when `user:` also names a group, keeps that mode in the image, and the
+agent, not root there, cannot import it; either way Compose starts it again and again.
+
+An eval set that step 0 of the gate replay (`redact_eval_set.py`) redacted with an earlier build must
+be redacted again with this build's step 0 before any replay. This build's step 0 also removes the
+dispatcher's repair token, header secrets (header lists such as `ANTHROPIC_CUSTOM_HEADERS`, header
+maps such as an MCP server's headers, and the variables they name) and, whatever the execution mode,
+the local mode's values, and its `redaction.json` says so with version 2. The replay refuses an
+earlier one before it builds any digest, exit 3, naming the intent folder
+(`replay_eval_set: <intent>: redaction.json was written by an earlier build's step 0 …`). As step 0's
+own text says (`docs/specs/repair-agent.md`, 评估门禁工具), run it as yourself on the host, in Compose
+too; it replaces only its own outputs:
+
+```bash
+uv run --project cairn python tools/repair-phase2/redact_eval_set.py eval-proj_027 --dispatch-config dispatch.yaml
+```
+
+In Compose, then make the redacted copy again: remove the earlier copy (`rm -r eval-proj_027-redacted`),
+which still holds the earlier outputs, and run that text's `rsync` again.
+
+Copies that the dispatcher made before you restarted it with this build (4 above; in Compose, the
+`up -d --build` above) keep the earlier build's redaction, which removed no header secrets, and they
+stay in the copy root as step 8 says: there is no time-based retention. An `export_shadow_runs.py`
+folder made from such a copy (live shadow runs, which grow the gate set: `docs/specs/repair-agent.md`,
+在线影子结论) holds it as it is, and the replay reads it as it reads every such folder, with no
+refusal: step 0 leaves these folders alone, and nothing in a copy or in the folder says which build
+redacted it. So unless every listed reviewer may receive what those copies hold, leave those runs out
+of any replay: remove from the export each intent folder whose run started before the dispatcher's
+restart (`execute_started_at` in its `intent.json`), or delete those runs' copies
+(`<copy root>/<project_id>/<run_id>/`, with `sudo` in Compose) before you export.
 
 From a build before the reviewer pin, a reviewer that leaves `max_tokens` out now gets 16384 rather
 than 4096, or less with `context_window` (step 3). An agent from before the reviewer pin refuses the
@@ -909,22 +966,35 @@ root's contents, with `sudo`). A Phase 2 server started on that file again creat
   0640, so the agent reads them, and the isolation check passes: no Docker socket and no
   `DOCKER_HOST`, `dispatch_config_to_check: null` (accepted only inside a container), and the copy
   root, the configuration and the token on read-only mounts.
-- **A non-root agent** is possible but not the default. Before the first `up`, create the copy root
-  with a group that user holds (`sudo install -d -m 2750 -o root -g <gid> datas/repair-transcripts`);
-  add `group_add: ["<gid>"]` and `user: "<uid>"` to `cairn-repair` in your copy of the override, never
-  a `USER` line in the image; make `secrets/repair-agent.token` owned by that uid with mode 0400 and
-  `./repair.compose.yaml` readable by it; and before the build make the agent's files readable by
-  others in your checkout (`chmod -R a+rX repair-agent/pyproject.toml repair-agent/uv.lock
-  repair-agent/src`), because the image keeps their mode bits and only removes write permission.
+- **A non-root agent** is possible but not the default. It runs from your copy of the override
+  (`cp docker-compose.repair.yaml <your copy of the override>`): use your copy in place of
+  `docker-compose.repair.yaml` in every `docker compose …` command of this runbook. With
+  `docker-compose.repair.yaml`, an `up` recreates the agent as root on the `cairn-repair-state`
+  volume, and a `run` reads that volume, not your agent's folder. Before the first `up`, create the
+  copy root with a group that user holds
+  (`sudo install -d -m 2750 -o root -g <gid> datas/repair-transcripts`); add `group_add: ["<gid>"]`
+  and `user: "<uid>"` to `cairn-repair` in your copy of the override, never a `USER` line in the
+  image; make `secrets/repair-agent.token` owned by that uid with mode 0400 and `./repair.compose.yaml`
+  readable by it; and make the agent's files readable by others in your checkout
+  (`chmod -R a+rX repair-agent/pyproject.toml repair-agent/uv.lock repair-agent/src`) before every
+  build of the image, after each `git pull` too, which writes the files it changes with your umask:
+  the image keeps their mode bits and only removes write permission.
   It also needs a state folder of its own, where it pins its reviewer: in your copy of the override,
   replace the line of the `cairn-repair-state` volume with
-  `- ./datas/repair-state:/var/lib/cairn-repair/state` (a copy made before the reviewer pin has no
-  such line: add this one to the `volumes:` of `cairn-repair`, as "Upgrading from an earlier Phase 2
-  build" says), and before the first `up` create that folder for that user:
-  `sudo install -d -m 0700 -o <uid> -g <gid> datas/repair-state`. The named volume
+  `- ./datas/repair-state:/var/lib/cairn-repair/state`, and before the first `up` create that folder
+  for that user: `sudo install -d -m 0700 -o <uid> -g <gid> datas/repair-state`. The named volume
   does not work for a non-root agent, even after a `chown`: whenever a container mounts it while it
   is empty, as it is until the agent's first pin, Docker gives it the owner and mode of the image's
-  folder again, root's and 0700, so the agent would stop with `state_dir_owner`.
+  folder again, root's and 0700, so the agent would stop with `state_dir_owner`. Its pin is then in
+  that folder on the host, which only that user and root can read: read it with
+  `sudo cat datas/repair-state/reviewer-pin.json` (step 4 f, "The reviewer pin"), and accept a
+  reviewer change with `sudo rm datas/repair-state/reviewer-pin.json`, then
+  `docker compose -f docker-compose.yaml -f <your copy of the override> up -d cairn-repair`
+  ("Accepting a reviewer change"). When a `git pull` changes `docker-compose.repair.yaml`, make your
+  copy again from it and re-apply your own changes (`user:`, `group_add:` and the bind mount), or run
+  `diff docker-compose.repair.yaml <your copy of the override>` and carry every other line over: a
+  copy made from an earlier build can lack lines added since, such as `stop_grace_period: 20s`
+  ("Upgrading from an earlier Phase 2 build").
 - **A model server on the host.** Inside the agent's container, `127.0.0.1` is the container itself.
   A server on the host is reached as `http://host.docker.internal:<port>/v1`, the `REVIEW_BASE_URL` of
   its reviewer entry, which `extra_hosts` maps to the host's Docker bridge address (`docker0`,

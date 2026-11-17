@@ -23,7 +23,11 @@ replaces each value, raw and JSON-escaped, with [REDACTED:<name>].
   be read, or whose content the dispatcher would refuse, gives one line naming the file, never a value, and the other
   values are removed all the same.
 
-redaction.json's value_sets names the sets of values used.
+redaction.json's value_sets names the sets of values used, and its version is 2. An earlier build's step 0 wrote 1 and
+removed fewer values: neither the repair token nor header secrets (header lists, header maps and the variables they
+name), and the local mode's values only with a local-mode dispatch.yaml. The replay refuses a report of any version
+but 2 (exit 3, naming the intent folder), so run this tool again on an eval set it redacted before an upgrade; it
+replaces only its own outputs. In Compose, then make the redacted copy of §15.3 again from the eval set.
 
 For each intent folder (a subfolder holding intent.json), every session file *.jsonl is redacted to
 transcript.redacted.jsonl beside it; with several session files (several timed-out attempts of the intent), the k-th
@@ -87,6 +91,9 @@ ATTEMPT_FOLDER = re.compile(r"attempt-[1-9][0-9]{0,5}")
 REDACTED_OUTPUT = re.compile(r"(?:attempt-[1-9][0-9]{0,5}/)?transcript\.redacted\.jsonl")
 SOURCE_MAX_BYTES = 1024 * 1024 * 1024
 REPORT_MAX_BYTES = 4 * 1024 * 1024
+# redaction.json's version: 2 since this tool also removes the repair token, header secrets and, whatever the mode,
+# the local mode's values. The replay (cairn_repair_agent.replay.REDACTION_VERSION) refuses any other version.
+REPORT_VERSION = 2
 EXIT_OK = 0
 EXIT_CONFIG = 2
 EXIT_INPUT = 3
@@ -352,7 +359,7 @@ def redact_folder(folder: Path, values: Mapping[str, str], value_sets: Sequence[
                 }
             )
         report = {
-            "version": 1,
+            "version": REPORT_VERSION,
             "written_by": WRITTEN_BY,
             "value_sets": list(value_sets),
             "files": entries,

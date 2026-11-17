@@ -14,9 +14,14 @@ Per intent folder of the eval set (`<eval>/<intent>/intent.json`, Phase 0's `exp
    `redaction.json`, which names each session file it redacted with its size and modification time. A session file
    that it does not name, or that changed since, is unredacted: the replay exits 3 before any digest is built, unless
    `--no-env-redaction` is given. So is a folder that still holds session files while `redaction.json` names one it no
-   longer holds: that one's output would be read as the case's transcript, so step 0 must run again. A folder without
-   session files (the Compose copy) is read as it is. A redacted output that `redaction.json` names and the folder
-   lacks (a copy of the eval set that left it out) refuses that case only.
+   longer holds: that one's output would be read as the case's transcript, so step 0 must run again. So is a folder
+   whose `redaction.json` is not of version 2 (`REDACTION_VERSION`), the Compose copy too: an earlier build's step 0
+   wrote it, which removes fewer values, so step 0 must run again (and the copy be made again); only
+   `export_shadow_runs.py`'s, which names the dispatcher's own copy, keeps its version 1 and is read as it is, even
+   when an earlier build's dispatcher made that copy, whose redaction removed no header secrets: neither the copy nor
+   the folder records the build (a known limit; the runbook's upgrade note says to leave such runs out). A folder
+   without session files (the Compose copy) is otherwise read as it is. A redacted output that `redaction.json` names
+   and the folder lacks (a copy of the eval set that left it out) refuses that case only.
 2. **Transcript.** The format is detected from the content; with several attempts, the latest by first timestamp is
    used (`--attempt first|last`).
 3. **Budget.** The attempt's `execute_timeout_s` from `intent.json`; `--budget` only where that is missing.
@@ -139,6 +144,14 @@ RUN_ID_RULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{7,63}")  # the server's rul
 # redact_eval_set.py's naming (it runs in the cairn environment, so the two keep their own copies of these rules).
 _ATTEMPT_FOLDER = re.compile(r"attempt-[1-9][0-9]{0,5}")
 _REDACTED_OUTPUT = re.compile(r"(?:attempt-[1-9][0-9]{0,5}/)?transcript\.redacted\.jsonl")
+# redaction.json's version as redact_eval_set.py writes it now (its REPORT_VERSION). An earlier build's step 0 wrote 1
+# and removed fewer values: neither the dispatcher's repair token nor header secrets, and the local mode's values only
+# with a local-mode dispatch.yaml.
+REDACTION_VERSION = 2
+# export_shadow_runs.py's redaction.json (export.WRITTEN_BY) names the dispatcher's own redacted copy, which step 0
+# never redacts again; its version is not step 0's. Such a folder is read as it is, even when an earlier build's
+# dispatcher made the copy (removing no header secrets): neither the copy nor the folder records the build.
+EXPORT_WRITTEN_BY = "export_shadow_runs.py"
 _LINE_FIELD = re.compile(r"(\w+)=%s")
 
 EXIT_OK = 0
@@ -288,8 +301,10 @@ class _MissingOutputsError(Exception):
 
 def transcript_files(folder: Path, *, allow_unredacted: bool) -> list[Path]:
     """The transcript files of an intent folder that the replay may read: the redacted outputs that `redaction.json`
-    names, when it also names every session file in the folder with the size and modification time it had when it was
-    redacted. A folder with redacted outputs and no `redaction.json` (a copy that left it out) offers its outputs.
+    names, when it is this build's step 0's (version 2) or export_shadow_runs.py's, and also names every session file
+    in the folder with the size and modification time it had when it was redacted; `allow_unredacted` reads one of an
+    earlier step 0 as before. A folder with redacted outputs and no `redaction.json` (a copy that left it out) offers
+    its outputs.
     A folder that lacks an output its `redaction.json` names (a copy that left it out) is a refused case: CaseError.
     Otherwise the folder holds an unredacted transcript: ReplayInputError, unless `allow_unredacted`, which reads the
     session files themselves."""
@@ -303,7 +318,7 @@ def transcript_files(folder: Path, *, allow_unredacted: bool) -> list[Path]:
         problem = "an unredacted transcript (no redaction.json)"
     else:
         try:
-            listed = _redacted_outputs(folder, sources, outputs)
+            listed = _redacted_outputs(folder, sources, outputs, allow_earlier=allow_unredacted)
         except _UnredactedError as exc:
             problem = str(exc)
         except _MissingOutputsError as exc:
@@ -319,9 +334,13 @@ def transcript_files(folder: Path, *, allow_unredacted: bool) -> list[Path]:
     )
 
 
-def _redacted_outputs(folder: Path, sources: Sequence[str], outputs: Sequence[str]) -> list[str]:
+def _redacted_outputs(
+    folder: Path, sources: Sequence[str], outputs: Sequence[str], *, allow_earlier: bool
+) -> list[str]:
     """The outputs redaction.json names, when it covers the folder. _UnredactedError when the folder may hold a
-    transcript that was not redacted, _MissingOutputsError when it lacks an output redaction.json names."""
+    transcript that was not redacted, or one that an earlier build's step 0 redacted (a report of another version
+    than REDACTION_VERSION, but export_shadow_runs.py's), unless `allow_earlier` (--no-env-redaction, which reads such
+    a folder as before); _MissingOutputsError when it lacks an output redaction.json names."""
     try:
         report = read_json_object(folder / REDACTION_REPORT, REDACTION_REPORT_MAX_BYTES, REDACTION_REPORT)
     except CaseError as exc:
@@ -329,6 +348,18 @@ def _redacted_outputs(folder: Path, sources: Sequence[str], outputs: Sequence[st
     entries = report.get("files")
     if not isinstance(entries, list):
         raise _UnredactedError("redaction.json has no files list")
+    version = report.get("version")
+    if (
+        not allow_earlier
+        and report.get("written_by") != EXPORT_WRITTEN_BY
+        and (type(version) is not int or version != REDACTION_VERSION)
+    ):
+        # Before every check of its entries: each output it names may hold what this build's step 0 removes, a copy
+        # without session files (Compose) too, so the whole replay stops rather than this case alone.
+        raise _UnredactedError(
+            f"redaction.json was written by an earlier build's step 0 (its version is not {REDACTION_VERSION}), "
+            "which removes fewer values; run redact_eval_set.py again"
+        )
     covered: dict[str, Mapping[str, Any]] = {}
     listed: list[str] = []
     for entry in entries:

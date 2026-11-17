@@ -14,11 +14,13 @@ and the run under Phase 0's `timed_out_attempts` with its budget and review wind
 read the folder), `digest.txt` (the stored digest, what the model saw), and, while the project's copy folder is kept
 (§8.8, Removal), the copy as `transcript.redacted.jsonl` with `redaction.json`: the dispatcher already removed the
 worker secrets from it (§8.8), and `redaction.json` says so (`written_by: export_shadow_runs.py`), so that
-`redact_eval_set.py` leaves the folder as it is. The copy root is `transcripts.root` of the agent's `repair.yaml`
-(`--config`, as the replay reads it) or `--copy-root`; with neither, the tool cannot know where the copies are, exports
-none and says so (a departure from §15.6's command line, which names no copy root). `shadow-P/labels.csv` is a
-template to fill in. Decisions go only to `shadow-P/decisions.jsonl`, outside the intent folders: label before you open
-it, and before you open the project's graph, which shows each decision on its node.
+`redact_eval_set.py` leaves the folder as it is, and the replay reads it as it is. A copy that an earlier build's
+dispatcher made keeps that build's redaction, which removed no header secrets, and nothing records the build: the
+runbook's upgrade note says to leave such runs out of a replay. The copy root is `transcripts.root` of the agent's
+`repair.yaml` (`--config`, as the replay reads it) or `--copy-root`; with neither, the tool cannot know where the copies
+are, exports none and says so (a departure from §15.6's command line, which names no copy root).
+`shadow-P/labels.csv` is a template to fill in. Decisions go only to `shadow-P/decisions.jsonl`, outside the intent
+folders: label before you open it, and before you open the project's graph, which shows each decision on its node.
 
 What the server returns is read as untrusted: a review's `model` is shown only when it is printable ASCII without
 spaces, at most 100 characters (the agent's own filter, §9.9), and an `evidence` that is not a list counts as none.

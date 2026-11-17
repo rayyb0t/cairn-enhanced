@@ -531,7 +531,7 @@ def mark_redacted(eval_dir: Path) -> None:
         target = folder / "transcript.redacted.jsonl"
         target.write_bytes(source.read_bytes())
         report = {
-            "version": 1,
+            "version": 2,  # redact_eval_set.py's REPORT_VERSION: the replay refuses an earlier step 0's report
             "files": [
                 {
                     "source": source.name,
